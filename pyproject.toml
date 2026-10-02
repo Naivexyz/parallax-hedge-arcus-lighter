@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "parallax-hedge-arcus"
+version = "1.3.1"
+description = "对冲刷量控制台 —— Arcus x RHC Lighter"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
+  # socks 附加包：Arcus 常配独立 SOCKS5 代理，没有它 httpx 会直接拒绝 socks5:// 地址
+  "httpx[socks]>=0.27",
+  "pydantic>=2.6",
+  "python-dotenv>=1.0",
+  # Arcus 订单推送（挂单成交门铃）
+  "websockets>=14",
+  # Arcus 下单用 Ed25519 签名
+  "cryptography>=42",
+  # lighter-sdk 必须【钉死 1.1.2】，不能用范围：
+  # 只有这个版本带当前的 Windows x64 签名器和 Robinhood 端点配置
+  # （chain id 466324）。范围可能装到没有 Windows 签名器的版本。
+  "lighter-sdk==1.1.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+parallax_hedge = ["web/*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,18 @@
+# 仓库里的 .env 是已清空密钥的公开模板（地址 / API key / 私钥 / 代理 / 账户编号均为空）。
+# 真实密钥只留在本机。不要把填好的密钥提交上去；本机私密覆盖用 .env.local（不提交）。
+.env.local
+*.pem
+*.key
+data/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# 打包产物
+*.zip

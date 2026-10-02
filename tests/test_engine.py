@@ -523,7 +523,36 @@ def test_after_min_hold_a_tight_spread_is_maker_closed():
         assert "Lighter" in logged["reason"] and "Arcus" in logged["reason"]
 
 
+def test_after_min_hold_a_wide_favorable_spread_is_maker_closed():
+    """某一个所一直更贵、缺口远宽于 1 bp：平仓是买便宜卖贵，最短持有后立刻平，不等回到 0。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        eng, store, _ = make(tmp, row(0.2, -0.2))
+
+        async def rich_lighter(market_id, symbol, limit=100):
+            from parallax_hedge.books import Book, Level
+            # 平多 Lighter：卖在卖一 211.20；买回 Arcus 在买一 210.00。买价更低，约 57 bp。
+            return Book(venue="lighter", symbol=symbol,
+                        bids=[Level(211.10, 50)], asks=[Level(211.20, 50)])
+
+        async def cheap_arcus(symbol):
+            from parallax_hedge.books import Book, Level
+            return Book(venue="arcus", symbol=symbol,
+                        bids=[Level(210.00, 50)], asks=[Level(210.10, 50)])
+
+        eng.service.client.lighter_book = rich_lighter
+        eng.service.client.arcus_book = cheap_arcus
+        store.upsert_task("OAI", enabled=1, leverage=6.0, rotation_hours=4.0,
+                          opened_at=time.time() - 4, corridor_at_open=8.3,
+                          open_direction="long_lighter_short_arcus", open_quantity=0.2)
+        d = run(eng.run_cycle())
+        assert d[0]["plan"] == "close" and "价差有利" in d[0]["reason"]
+        assert "不超过" not in d[0]["reason"]
+        assert "211.2" in d[0]["reason"] and "210" in d[0]["reason"]
+        assert store.get_task("OAI")["opened_at"] is None
+
+
 def test_after_min_hold_a_wide_spread_waits_instead_of_closing():
+    """宽，但是平仓会买更贵的一边：不是「价差还没回到 0」，而是方向不利，所以继续持有。"""
     with tempfile.TemporaryDirectory() as tmp:
         eng, store, _ = make(tmp, row(0.2, -0.2))
 

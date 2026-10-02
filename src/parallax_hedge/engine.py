@@ -398,7 +398,7 @@ class HedgeEngine:
                     # 价差闸门没过：还没下单，不是开仓失败
                     logged_plan, logged_reason = "spread_wait", result.reason or "价差过宽，不开仓"
                 elif result.stage == "close_wait":
-                    logged_plan, logged_reason = "close_wait", result.reason or "价差过宽，先不平"
+                    logged_plan, logged_reason = "close_wait", result.reason or "平仓买价不低于卖价，先不平"
                 elif result.stage == "legs_timeout":
                     logged_plan, logged_reason = "maker_wait", result.reason or "两腿未都成交，已撤单"
                 elif not result.ok:

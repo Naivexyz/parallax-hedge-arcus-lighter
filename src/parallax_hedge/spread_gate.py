@@ -176,9 +176,10 @@ def close_prices_allowed(
 ) -> tuple[bool, float | None, str]:
     """计划内平仓：只看这一次平仓是在收价差还是在付价差。
 
-    买价 < 卖价：有利，捕获价差。无论多少 bp 都允许立刻挂 maker，
-    不看 MAX_SPREAD_BPS。
-    买价 >= 卖价：不利，要付价差（或平价）。不许提前平，交给最长持有后的强制平仓。
+    买价 < 卖价：有利。买更便宜的一边、卖更贵的一边。无论多少 bp 都立刻挂 maker。
+    不看 MAX_SPREAD_BPS，不等缺口缩回开仓阈值，也不等价差回到 0。
+    某一个所一直更贵，是马上平的理由，不是继续等的理由。
+    买价 >= 卖价：不利，要付价差（或平价）。不许提前平，只在最长持有后强制平仓。
     """
     try:
         buy = float(buy_price)
@@ -198,7 +199,7 @@ def close_prices_allowed(
         )
     return True, bps, (
         f"价差有利：平仓买价 {buy:g} 低于卖价 {sell:g}（{abs(bps):.2f} bp），"
-        f"忽略价差阈值，立即挂 maker"
+        f"不等价差回到 0，也不看开仓阈值，立即挂 maker"
     )
 
 

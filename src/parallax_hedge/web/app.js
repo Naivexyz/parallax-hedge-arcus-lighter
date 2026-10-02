@@ -395,9 +395,11 @@ async function loadTasks() {
     renderUnmanaged(t.unmanaged);
     const banner = $('dry-banner');
     banner.className = 'dry-banner' + (t.dry_run ? '' : ' live');
-    const gateNote = ` <b>价差闸门已开启</b>：只在 Arcus 与 Lighter 绝对价差 ≤ ${esc(t.max_spread_bps ?? 1)} bp 时两边一起挂 maker`
-      + `（买更便宜的一边、卖更贵的一边，开仓不间隔下单）。`
-      + `两腿都成交后至少持有 ${esc(t.min_hold_sec ?? 3)} 秒，平仓买价低于卖价（价差有利）就立即挂 maker，宽度不限；买价不低于卖价则继续持有。`
+    const gateNote = ` <b>价差闸门已开启</b>：开仓、补仓只在买价严格低于卖价、且绝对价差不超过 ${esc(t.max_spread_bps ?? 1)} bp 时两边一起挂 maker`
+      + `（买更便宜的一边、卖更贵的一边）。这个宽度只约束开仓，不约束平仓。`
+      + `某一个所可以一直更贵，不要等价差回到 0。`
+      + `两腿都成交后至少持有 ${esc(t.min_hold_sec ?? 3)} 秒；之后只要平仓是买便宜的一边、卖贵的一边，就立即挂 maker，多宽都平，不等缺口缩回开仓阈值。`
+      + `平仓如果会买到更贵的一边，就不提前平。`
       + `<b>持有满 ${esc(t.max_hold_sec ?? 300)} 秒仍未平掉就强制平仓，不再等价差。</b>`
       + `同一套规则用于面板里已有的全部重叠市场，包括美股永续，不单限 BTC、ETH。风控平仓仍立刻吃单。`;
     banner.innerHTML = t.dry_run

@@ -1377,3 +1377,68 @@ def test_a_loss_worse_than_the_window_does_not_close_before_max_hold():
         assert d[0]["plan"] == "idle" and "先不平" in d[0]["reason"]
         assert spy.calls == []
         assert store.get_task("OAI")["opened_at"] is not None
+
+
+def test_sol_mark_pnl_inside_the_window_does_not_send_when_live_close_loses_more():
+    """2026-10 SOL：标记浮盈亏 -0.0167 在 0.02 以内，但按即将发出的平仓价
+    （Arcus 买 119.766、Lighter 卖 119.739，3.345）往返约 -0.12。不能发单。
+    最长持有到了仍然可以强制挂 maker 平。
+    """
+    from parallax_hedge.spread_gate import round_trip_close_net
+
+    mark = 119.75
+    qty = 3.345
+    lighter_entry, arcus_entry = 119.766, 119.757
+    lighter_ask, arcus_bid = 119.739, 119.766
+    net = round_trip_close_net(qty, lighter_entry, lighter_ask, -qty, arcus_entry, arcus_bid)
+    assert net == pytest.approx(-0.12042, abs=1e-4)
+    assert net < -0.02
+
+    def sol_row():
+        def leg(size, entry, pnl, liq_mult):
+            return {
+                "size": size, "entry_price": entry, "mark_price": mark,
+                "liquidation_price": mark * liq_mult, "unrealized_pnl": pnl, "margin": 10.0,
+            }
+        base = row(qty, -qty, mark=mark, lighter_pnl=-0.0167, arcus_pnl=0.0)
+        base["position"]["lighter"] = leg(qty, lighter_entry, -0.0167, 0.9)
+        base["position"]["arcus"] = leg(-qty, arcus_entry, 0.0, 1.1)
+        return base
+
+    with tempfile.TemporaryDirectory() as tmp:
+        eng, store, _ = make(tmp, sol_row(), dry_run=False)
+        eng.settings.arcus_maker = True
+        eng.settings.pnl_close_usd = 0.02
+
+        async def markets(force=False):
+            return [dict(MARKET, arcus_tick_size="0.001")]
+
+        eng.service.client.common_markets = markets
+        _override_books(eng, 119.730, lighter_ask, arcus_bid, 119.767)
+        spy = CloseSpy()
+        eng.executor = spy
+        store.upsert_task(
+            "OAI", enabled=1, leverage=6.0, rotation_hours=4.0,
+            opened_at=time.time() - 30, corridor_at_open=8.3,
+            open_direction="long_lighter_short_arcus", open_quantity=qty,
+        )
+        d = run(eng.run_cycle())
+        assert d[0]["plan"] == "maker_started"
+        _drain(eng)
+        assert spy.calls == []
+        assert store.get_task("OAI")["opened_at"] is not None
+        logged = store.recent_cycles()[0]
+        assert logged["plan"] == "close_wait"
+        assert "先不平" in logged["reason"]
+        assert "-0.1204" in logged["reason"] or "-0.120" in logged["reason"]
+
+        store.upsert_task("OAI", opened_at=time.time() - 301)
+        forced = run(eng.run_cycle())
+        assert forced[0]["plan"] == "maker_started" and "强制" in forced[0]["reason"]
+        _drain(eng)
+        assert [name for name, _ in spy.calls] == ["place_maker_pair"]
+        kw = spy.calls[0][1]
+        assert kw["action"] == "close" and kw["reduce_only"] is True
+        assert kw["quotes"]["force_close"] is True
+        assert kw["lighter_side"] == "sell" and kw["arcus_side"] == "buy"
+        assert store.get_task("OAI")["opened_at"] is None

@@ -36,7 +36,7 @@ from .risk import (
 from .ledger import ledger_rows_for_result
 from .scheduler import CycleDecision, TaskState, decide, draw_hold_hours
 from .service import FundingService
-from .spread_gate import evaluate_books, hedge_take_price, join_price, open_sides_allowed, unrealized_close_ready
+from .spread_gate import evaluate_books, hedge_take_price, join_price, open_sides_allowed, round_trip_close_net, unrealized_close_ready
 from .store import Store
 
 # 开仓后复核的重试节奏：Lighter 是 rollup，账户接口要几秒才反映新仓位。
@@ -517,6 +517,8 @@ class HedgeEngine:
                 self.store.mark_closed(asset)
                 return None
             lighter_side, arcus_side = closing_sides(lighter, arcus)
+            lighter_entry = health.lighter.entry_price if health.lighter else None
+            arcus_entry = health.arcus.entry_price if health.arcus else None
             books = await self._books(market)
             lighter_px = arcus_px = price
             if books is not None:
@@ -533,6 +535,7 @@ class HedgeEngine:
                 return await self._gated_maker_close(
                     decision, market, lighter, arcus, lighter_side, arcus_side,
                     books, decimals, slippage, stop,
+                    lighter_entry=lighter_entry, arcus_entry=arcus_entry,
                 )
             result = await self.executor.close_pair(
                 market=market, lighter_size=lighter, arcus_size=arcus,
@@ -785,7 +788,7 @@ class HedgeEngine:
         if age >= max_hold:
             net_text = "未知" if net_pnl is None else f"{net_pnl:+.4f}"
             return replace(
-                decision, plan="close", urgent=False, maker_ok=True,
+                decision, plan="close", urgent=False, maker_ok=True, force_close=True,
                 reason=(
                     f"两腿成交后已持有 {age:.0f} 秒，达到最长持有 {max_hold:g} 秒，"
                     f"浮盈亏合计 {net_text} USDC，即使差于 -{window:g} 也强制平仓（挂 maker）"
@@ -863,8 +866,9 @@ class HedgeEngine:
     async def _gated_maker_close(
         self, decision, market, lighter, arcus, lighter_side, arcus_side,
         books, decimals, slippage, stop,
+        lighter_entry: float | None = None, arcus_entry: float | None = None,
     ) -> PairResult:
-        """计划内平仓：引擎已经按浮盈亏决定要平。这里只挂 maker，不看价差方向。"""
+        """计划内平仓：两边挂 maker。发单前用即将发出的价格重算往返，不单看标记浮盈亏。"""
         if books is None:
             return PairResult(
                 False, "close_wait", reason="拿不到两边盘口，计划内平仓先等下一轮",
@@ -882,37 +886,64 @@ class HedgeEngine:
                 dry_run=self.dry_run,
                 notes=["尚未下任何单"],
             )
+        window = max(0.0, float(self.settings.pnl_close_usd))
+        force = bool(getattr(decision, "force_close", False))
         quotes = {
             "lighter_join": lighter_join,
             "arcus_join": float(arcus_join),
+            "pnl_close_usd": window,
+            "force_close": force,
+            "close_entries": {
+                "lighter_size": lighter,
+                "arcus_size": arcus,
+                "lighter_entry": lighter_entry,
+                "arcus_entry": arcus_entry,
+            },
         }
+        est = round_trip_close_net(
+            lighter, lighter_entry, float(lighter_join),
+            arcus, arcus_entry, float(arcus_join),
+        )
+        quotes["estimated_close_net"] = None if est is None else round(est, 6)
+        if not force and (est is None or not unrealized_close_ready(est, window)):
+            shown = "未知" if est is None else f"{est:+.4f}"
+            return PairResult(
+                False, "close_wait",
+                reason=(
+                    f"标记浮盈亏不足以放行：按即将发出的平仓价估算往返 {shown} USDC，"
+                    f"差于 -{window:g}，未到最长持有，先不平"
+                ),
+                dry_run=self.dry_run, quotes=quotes,
+                notes=["尚未下任何单"],
+            )
         quotes["close_favorable"] = True
         quotes["close_prices"] = (
             f"挂 maker 平仓：Lighter {lighter_side} {float(lighter_join):g} / "
             f"Arcus {arcus_side} {float(arcus_join):g}"
         )
-        if self.settings.arcus_maker and not self.dry_run:
+        # 正常平仓两边都挂 maker。不要走「Arcus 一成交就 IOC 对冲 Lighter」。
+        # 只有执行器没有 place_maker_pair 的测试替身才退回旧路径。
+        fn = getattr(self.executor, "place_maker_pair", None)
+        if fn is not None:
+            result = await fn(
+                market=market, lighter_side=lighter_side, arcus_side=arcus_side,
+                lighter_quantity=abs(lighter), arcus_quantity=abs(arcus),
+                lighter_price=lighter_join, arcus_price=float(arcus_join),
+                lighter_decimals=decimals, quotes=quotes, reduce_only=True,
+                action="close", stop=stop,
+            )
+        elif self.settings.arcus_maker and not self.dry_run:
             result = await self._maker(stop).close_pair(
                 market=market, lighter_size=lighter, arcus_size=arcus,
                 lighter_price=lighter_join, arcus_price=float(arcus_join),
                 slippage_bps=slippage, lighter_decimals=decimals,
             )
         else:
-            fn = getattr(self.executor, "place_maker_pair", None)
-            if fn is None:
-                result = await self.executor.close_pair(
-                    market=market, lighter_size=lighter, arcus_size=arcus,
-                    lighter_price=lighter_join, arcus_price=float(arcus_join),
-                    slippage_bps=slippage, lighter_decimals=decimals,
-                )
-            else:
-                result = await fn(
-                    market=market, lighter_side=lighter_side, arcus_side=arcus_side,
-                    lighter_quantity=abs(lighter), arcus_quantity=abs(arcus),
-                    lighter_price=lighter_join, arcus_price=float(arcus_join),
-                    lighter_decimals=decimals, quotes=quotes, reduce_only=True,
-                    action="close", stop=stop,
-                )
+            result = await self.executor.close_pair(
+                market=market, lighter_size=lighter, arcus_size=arcus,
+                lighter_price=lighter_join, arcus_price=float(arcus_join),
+                slippage_bps=slippage, lighter_decimals=decimals,
+            )
         if result.ok:
             if not isinstance(result.quotes, dict):
                 result.quotes = {}

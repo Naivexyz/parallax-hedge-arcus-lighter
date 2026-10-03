@@ -37,7 +37,7 @@ from .fills import (
     slippage_limit_price,
 )
 from .positions import parse_arcus_position, parse_lighter_position
-from .spread_gate import join_price, open_sides_allowed
+from .spread_gate import join_price, open_sides_allowed, round_trip_close_net, unrealized_close_ready
 
 # 下单后轮询仓位的节奏。Lighter 是链上交易，确认要一点时间；
 # Parallax 用的是 4 次重试，这里沿用。
@@ -194,6 +194,34 @@ class PairResult:
             "arcus": self.arcus.to_dict() if self.arcus else None,
             "rescue": self.rescue.to_dict() if self.rescue else None,
         }
+
+
+
+def _close_send_allowed(quotes: dict[str, Any], lighter_px: float, arcus_px: float) -> tuple[bool, str]:
+    """计划内平仓：用即将发出（或已经挂着）的两个价格估算往返。
+
+    没有开仓价时不在这里拦（引擎已经拦过，旧测试也不带开仓价）。
+    最长持有强制平仓不拦。估算差于浮盈亏差额就返回 False，调用方撤未成交的 maker，不改吃单。
+    """
+    if quotes.get("force_close"):
+        return True, "已到最长持有，允许平仓"
+    entries = quotes.get("close_entries")
+    if not isinstance(entries, dict) or not entries:
+        return True, ""
+    window = quotes.get("pnl_close_usd")
+    if window is None:
+        window = 0.02
+    net = round_trip_close_net(
+        entries.get("lighter_size"), entries.get("lighter_entry"), lighter_px,
+        entries.get("arcus_size"), entries.get("arcus_entry"), arcus_px,
+    )
+    if net is None or not unrealized_close_ready(net, window):
+        shown = "未知" if net is None else f"{net:+.4f}"
+        return False, (
+            f"按即将发出的平仓价估算往返 {shown} USDC，"
+            f"差于 -{float(window):g}，先不平"
+        )
+    return True, f"按即将发出的平仓价估算往返 {net:+.4f} USDC"
 
 
 class Executor:
@@ -1183,6 +1211,13 @@ class Executor:
                 notes=["买卖价没有通过最后一道价差检查，尚未下任何单"],
             )
         if action == "close":
+            net_ok, net_why = _close_send_allowed(quotes, float(lighter_price), float(arcus_price))
+            if not net_ok:
+                return PairResult(
+                    False, "close_wait", reason=net_why, dry_run=False, quotes=quotes,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                    notes=["按即将发出的两个价格估算过不了浮盈亏差额，尚未下任何单"],
+                )
             quotes["close_favorable"] = True
             quotes["close_prices"] = (
                 f"挂 maker 平仓：Lighter {lighter_side} {float(lighter_price):g} / "
@@ -1219,8 +1254,15 @@ class Executor:
         if fresh is not None:
             _ok, _why, live_l, _live_a = fresh
             if action == "close":
-                # 平仓不因为买价高于卖价撤掉。Arcus 已经挂出，Lighter 继续挂 maker。
-                leg_ok, leg_why = bool(_ok) and float(live_l) > 0, _why
+                # 平仓不因为买价高于卖价撤掉。但第二腿必须仍能通过浮盈亏差额。
+                # 过不了就撤掉已经挂出、还没成交的那一腿，不改吃单，除非最长持有强制平。
+                if quotes.get("force_close"):
+                    leg_ok = bool(_ok) and float(live_l) > 0
+                    leg_why = _why
+                else:
+                    leg_ok, leg_why = _close_send_allowed(quotes, float(live_l), posted_arcus)
+                    if not _ok:
+                        leg_ok, leg_why = False, _why or leg_why
             else:
                 leg_ok, _bps, leg_why = open_sides_allowed(
                     lighter_side, arcus_side, float(live_l), posted_arcus, None,
@@ -1237,16 +1279,22 @@ class Executor:
         if not leg_ok:
             await self._cancel_maker_resting(market, arcus, None)
             after_l, after_a = await self.read_positions(lighter_symbol, arcus_id)
-            await self._flatten_naked_maker_leg(
-                market, lighter_side, arcus_side,
-                before_lighter, before_arcus, after_l, after_a,
-                lighter_price, posted_arcus, lighter_decimals,
-            )
+            # 正常平仓：不因为一边先成交就 IOC。强制平仓才允许更差的对冲。
+            hedge_worse = action != "close" or bool(quotes.get("force_close"))
+            if hedge_worse:
+                await self._flatten_naked_maker_leg(
+                    market, lighter_side, arcus_side,
+                    before_lighter, before_arcus, after_l, after_a,
+                    lighter_price, posted_arcus, lighter_decimals,
+                )
+                note = "Lighter 尚未下单；Arcus 已撤，成交的部分已对冲"
+            else:
+                note = "Lighter 尚未下单；未成交的 maker 已撤，不改吃单对冲"
             return PairResult(
                 False, "close_wait" if action == "close" else "spread_wait",
                 arcus=arcus, reason=leg_why, quotes=quotes,
                 elapsed_ms=(time.monotonic() - started) * 1000,
-                notes=["Lighter 尚未下单；Arcus 已撤，成交的部分已对冲"],
+                notes=[note],
             )
         # Lighter 用刚对过已挂 Arcus 价的那个价。Arcus 不再改价。
         lighter = LegResult("lighter", True, submitted=False, raw={"skipped": "flat"})
@@ -1286,20 +1334,37 @@ class Executor:
                     posted_ok, _bps, posted_why = open_sides_allowed(
                         lighter_side, arcus_side, float(live_l), float(arcus.price), None,
                     )
+                if action == "close" and not quotes.get("force_close") and (filled_l ^ filled_a):
+                    # 一边已经成交：另一边必须还挂在能通过差额的价格上。过不了就撤，不吃单。
+                    check_l = float(lighter.price) if lighter.price else float(live_l)
+                    check_a = float(arcus.price) if arcus.price else float(live_a)
+                    net_ok, net_why = _close_send_allowed(quotes, check_l, check_a)
+                    if not net_ok:
+                        await self._cancel_maker_resting(market, arcus, lighter)
+                        return PairResult(
+                            False, "close_wait", lighter, arcus,
+                            reason=net_why, quotes=quotes,
+                            elapsed_ms=(time.monotonic() - started) * 1000,
+                            notes=["一边已成交，另一边挂单价过不了浮盈亏差额，已撤未成交 maker，不吃单对冲"],
+                        )
                 if (not still_ok or not posted_ok) and not (filled_l and filled_a):
                     await self._cancel_maker_resting(market, arcus, lighter)
                     after_l, after_a = await self.read_positions(lighter_symbol, arcus_id)
-                    await self._flatten_naked_maker_leg(
-                        market, lighter_side, arcus_side,
-                        before_lighter, before_arcus, after_l, after_a,
-                        lighter_price, arcus_price, lighter_decimals,
-                    )
+                    if action != "close" or quotes.get("force_close"):
+                        await self._flatten_naked_maker_leg(
+                            market, lighter_side, arcus_side,
+                            before_lighter, before_arcus, after_l, after_a,
+                            lighter_price, arcus_price, lighter_decimals,
+                        )
+                        note = "挂单价格已不再通过价差检查，已撤单；已成交的腿已对冲"
+                    else:
+                        note = "挂单价格已不再通过检查，已撤未成交 maker，不吃单对冲"
                     why = still_why if not still_ok else posted_why
                     return PairResult(
                         False, "close_wait" if action == "close" else "spread_wait",
                         lighter, arcus, reason=why or "价差不再合格，已撤单",
                         quotes=quotes, elapsed_ms=(time.monotonic() - started) * 1000,
-                        notes=["挂单价格已不再通过价差检查，已撤单；已成交的腿已对冲"],
+                        notes=[note],
                     )
             if stop is not None and stop.is_set():
                 await self._cancel_maker_resting(market, arcus, lighter)
@@ -1328,17 +1393,34 @@ class Executor:
         if not (filled_l and filled_a):
             await self._cancel_maker_resting(market, arcus, lighter)
             after_l, after_a = await self.read_positions(lighter_symbol, arcus_id)
-            await self._flatten_naked_maker_leg(
-                market, lighter_side, arcus_side,
-                before_lighter, before_arcus, after_l, after_a,
-                lighter_price, arcus_price, lighter_decimals,
-            )
             filled_l = lighter_quantity <= 0 or classify_fill(
                 before=before_lighter, after=after_l, requested_signed=lighter_signed,
             ).kind == "full"
             filled_a = arcus_quantity <= 0 or classify_fill(
                 before=before_arcus, after=after_a, requested_signed=arcus_signed,
             ).kind == "full"
+            if action == "close" and not quotes.get("force_close"):
+                if (filled_l or filled_a) and not (filled_l and filled_a):
+                    return PairResult(
+                        False, "close_wait", lighter, arcus,
+                        reason="一边已成交，另一边未在通过差额的价格上成交，已撤未成交 maker，不吃单对冲",
+                        quotes=quotes, elapsed_ms=(time.monotonic() - started) * 1000,
+                        notes=["不把未对上的成交改成更差的吃单，除非已到最长持有"],
+                        ledger=[("close", leg) for leg in (lighter, arcus) if leg.submitted],
+                    )
+            else:
+                await self._flatten_naked_maker_leg(
+                    market, lighter_side, arcus_side,
+                    before_lighter, before_arcus, after_l, after_a,
+                    lighter_price, arcus_price, lighter_decimals,
+                )
+                after_l, after_a = await self.read_positions(lighter_symbol, arcus_id)
+                filled_l = lighter_quantity <= 0 or classify_fill(
+                    before=before_lighter, after=after_l, requested_signed=lighter_signed,
+                ).kind == "full"
+                filled_a = arcus_quantity <= 0 or classify_fill(
+                    before=before_arcus, after=after_a, requested_signed=arcus_signed,
+                ).kind == "full"
         if filled_l and filled_a:
             if lighter.submitted:
                 lighter.filled = lighter_quantity

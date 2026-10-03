@@ -4,9 +4,10 @@
 不再用绝对价差多少 bp 决定开不开。宽，但买得更便宜，仍然开。
 
 计划内平仓不看价差，也不看 bp。两腿都成交并过了最短持有之后，
-看两边浮盈亏加总：不低于「负的浮盈亏差额」就挂 maker 平。
-差额 0.02 时，合计 0、-0.02 都平，-0.05 先不平。持满最长持有仍强制平。
-平仓挂 maker，不因为价差方向把单撤掉。风控触发的平仓仍然立刻吃单。
+发单前用两边即将挂出的价格重算往返盈亏，不能只看标记浮盈亏。
+估算亏损差于「浮盈亏差额」就先不发，等到最长持有。
+差额 0.02 时，按挂单价估算的合计 0、-0.02 都平，更差先不平。
+正常平仓两边都挂 maker。风控触发的平仓仍然立刻吃单。
 
 闸门不挑币种：面板里已经能交易的重叠市场都走同一套，包括美股永续。
 """
@@ -184,6 +185,38 @@ def unrealized_close_ready(net_pnl: float, window_usd: float) -> bool:
     if window < 0:
         window = 0.0
     return net + 1e-9 >= -window
+
+
+def round_trip_close_net(
+    lighter_size: float, lighter_entry: float | None, lighter_close: float,
+    arcus_size: float, arcus_entry: float | None, arcus_close: float,
+) -> float | None:
+    """用即将发出的平仓价估算两边合起来的往返盈亏，不用标记价。
+
+    带符号数量：多头为正。盈亏 = (平仓价 - 开仓价) × 数量，空头同样成立。
+    缺开仓价、或价格无效时返回 None。调用方不能改用标记浮盈亏放行。
+    """
+    total = 0.0
+    seen = False
+    for size, entry, close in (
+        (lighter_size, lighter_entry, lighter_close),
+        (arcus_size, arcus_entry, arcus_close),
+    ):
+        try:
+            qty = float(size)
+            opened = float(entry) if entry is not None else float("nan")
+            px = float(close)
+        except (TypeError, ValueError):
+            return None
+        if abs(qty) <= 1e-12:
+            continue
+        if opened != opened or px != px or opened <= 0 or px <= 0:
+            return None
+        if opened in (float("inf"), float("-inf")) or px in (float("inf"), float("-inf")):
+            return None
+        total += (px - opened) * qty
+        seen = True
+    return total if seen else None
 
 
 def close_prices_allowed(

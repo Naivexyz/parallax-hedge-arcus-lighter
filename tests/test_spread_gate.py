@@ -268,3 +268,85 @@ def test_an_unfavorable_close_is_still_a_maker_order():
     result = asyncio.get_event_loop().run_until_complete(run())
     assert result.ok and result.stage == "closed" and result.dry_run
     assert result.lighter.raw["post_only"] and result.arcus.raw["timeInForce"] == "ALO"
+
+
+def test_sol_second_maker_that_fails_the_window_is_not_ioc_hedged():
+    """Arcus 先挂上之后，Lighter 的价会把 3.345 SOL 的往返打到约 -0.12。
+    撤掉未成交的 maker，不能 IOC。
+    """
+    from parallax_hedge.execution import LegResult
+    from parallax_hedge.spread_gate import round_trip_close_net
+
+    qty = 3.345
+    quotes = {
+        "pnl_close_usd": 0.02,
+        "force_close": False,
+        "close_entries": {
+            "lighter_size": qty,
+            "arcus_size": -qty,
+            "lighter_entry": 119.766,
+            "arcus_entry": 119.757,
+        },
+    }
+    bad = round_trip_close_net(qty, 119.766, 119.739, -qty, 119.757, 119.766)
+    assert bad < -0.02
+
+    settings = Settings(env_path=Path("."), data_dir=Path("."), dry_run=False,
+                        pnl_close_usd=0.02, maker_wait_seconds=2, lighter_account_index=1)
+    ex = Executor(settings, market=object(), dry_run=False)
+    sent = []
+    phase = {"n": 0}
+
+    async def read_positions(symbol, market_id):
+        return qty, -qty
+
+    async def fresh(market, lighter_side, arcus_side, closing=False):
+        phase["n"] += 1
+        # 第一次刷新还过得了；挂出 Arcus 之后 Lighter 变成 119.739，过不了。
+        if phase["n"] == 1:
+            return True, "先过", 119.764, 119.757
+        return True, "变差", 119.739, 119.766
+
+    async def place_arcus(*a, **k):
+        sent.append("arcus")
+        return LegResult("arcus", True, submitted=True, raw={"orderId": "a1"}, price=119.757)
+
+    async def place_lighter(*a, **k):
+        sent.append("lighter")
+        raise AssertionError("不该再挂 Lighter")
+
+    async def ioc(*a, **k):
+        sent.append("ioc")
+        raise AssertionError("不该 IOC 对冲")
+
+    async def flatten(*a, **k):
+        sent.append("flatten")
+        raise AssertionError("不该吃单对冲")
+
+    ex.read_positions = read_positions
+    ex._fresh_maker_prices = fresh
+    ex._arcus_place = place_arcus
+    ex._lighter_post_only = place_lighter
+    ex._lighter_ioc = ioc
+    ex._flatten = flatten
+    async def cancel(*a, **k):
+        sent.append("cancel")
+
+    ex._arcus_cancel = cancel
+    ex.build_arcus_order = lambda *a, **k: {"signed": True}
+
+    async def run():
+        return await ex.place_maker_pair(
+            market={"lighter_symbol": "SOL", "lighter_market_index": 0, "arcus_market_id": 2,
+                    "arcus_symbol": "SOL-USD"},
+            lighter_side="sell", arcus_side="buy",
+            lighter_quantity=qty, arcus_quantity=qty,
+            lighter_price=119.764, arcus_price=119.757,
+            lighter_decimals=(3, 3), quotes=quotes, action="close", reduce_only=True,
+        )
+
+    result = asyncio.get_event_loop().run_until_complete(run())
+    assert result.ok is False and result.stage == "close_wait"
+    assert sent == ["arcus", "cancel"]
+    assert "尚未下任何单" not in (result.notes or [""])[0]
+    assert "不改吃单" in result.notes[0] or "不吃单" in result.notes[0]

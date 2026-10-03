@@ -107,6 +107,9 @@ class CycleDecision:
     orphan_size: float = 0.0
     # 这次平仓能不能慢慢挂单平：只有正常轮换和停用收尾可以；风控触发的平仓必须立刻吃单
     maker_ok: bool = False
+    # 已到最长持有：即使按即将发出的价格估算亏损差于差额，也允许平。
+    # 这时才可以在 maker 过不了时改用更差的对冲。平时不行。
+    force_close: bool = False
 
     @property
     def is_action(self) -> bool:

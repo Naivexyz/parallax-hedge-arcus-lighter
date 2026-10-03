@@ -25,7 +25,7 @@ Arcus 这条腿改成挂单，手续费归零，还能省下 Arcus 那半个买�
   · Lighter 对冲失败（重试一次、放宽滑点仍然不成）→ 撤掉 Arcus 挂单，
     把没对冲上的 Arcus 仓位立刻吃单平掉。
   · 开仓等到超时一点都没成交 → 撤单，什么都没发生，下一轮再挂，零成本。
-  · 平仓等到超时没平完 → 剩下的部分退回吃单模式平掉（平仓必须完成）。
+  · 平仓等到超时没平完 → 已成交的部分留在 Lighter 对冲上，剩余继续挂 maker，不改吃单（Arcus 吃单要付费）。
   · 风控触发的平仓（离强平太近、两腿不匹配、孤腿）【一律吃单】，不等。
   · 撤单确认不了（网络断了）→ 不再挂新单，交给下一轮的孤腿 / 不匹配检查兜底。
 """
@@ -186,7 +186,11 @@ class MakerExecutor:
         lighter_price: float, arcus_price: float, slippage_bps: float,
         lighter_decimals: tuple[int, int],
     ) -> PairResult:
-        """先挂单平；等不到的部分退回吃单平（平仓必须完成）。"""
+        """Arcus 挂 maker 平，成交多少就立刻用 Lighter 对冲多少。
+
+        等不到的剩余不改吃单，免得 Arcus 付吃单费。下一轮再挂。
+        对冲失败时，没对上的 Arcus 成交仍会吃单减掉，不留裸腿。
+        """
         started = self.clock()
         target = min(abs(lighter_size), abs(arcus_size))
         run = None
@@ -201,7 +205,7 @@ class MakerExecutor:
         ledger = [("close", leg) for leg in (self._booked(run) if run else [])]
         notes = list(run.notes) if run else []
 
-        # 剩下的（没等到的、零碎的、对冲失败的）全部交给吃单平仓，按两边【当前】仓位来
+        # 按两边当前仓位看：都平掉才算完成。没挂完的剩余不改吃单。
         lighter_now, arcus_now = await self.ex.read_positions(
             market["lighter_symbol"], int(market["arcus_market_id"]))
         if math.isfinite(lighter_now) and math.isfinite(arcus_now) \
@@ -210,21 +214,32 @@ class MakerExecutor:
                               self._last(run.arcus_legs, "arcus") if run else None,
                               elapsed_ms=(self.clock() - started) * 1000,
                               notes=notes + ["全部挂单平掉"], ledger=ledger)
-        if not (math.isfinite(lighter_now) and math.isfinite(arcus_now)):
-            # 读不到仓位：按传进来的原始仓位减去挂单阶段已处理的量去平
-            done = run.hedged if run else 0.0
-            lighter_now = math.copysign(max(0.0, abs(lighter_size) - done), lighter_size)
-            arcus_now = math.copysign(max(0.0, abs(arcus_size) - (run.filled if run else 0.0)),
-                                      arcus_size)
-        rest = await self.ex.close_pair(
-            market=market, lighter_size=lighter_now, arcus_size=arcus_now,
-            lighter_price=lighter_price, arcus_price=arcus_price,
-            slippage_bps=slippage_bps, lighter_decimals=lighter_decimals,
+        hedged = run.hedged if run else 0.0
+        if run is not None and run.unhedged > 0 and (run.error or run.stale_order):
+            # 已经成交、Lighter 没对上：把这条腿吃单减掉，不留裸腿。这不是把整仓改吃单。
+            rescue = await self.ex._flatten(
+                market, "arcus", run.unhedged,
+                "sell" if arcus_size < 0 else "buy",
+                arcus_price, slippage_bps, lighter_decimals,
+            )
+            ledger.append(("rescue", rescue))
+            return PairResult(
+                False, "maker_hedge_failed",
+                self._last(run.lighter_legs, "lighter"),
+                self._last(run.arcus_legs, "arcus"), rescue,
+                reason=(run.error or "Arcus 挂单撤不掉") + " —— 没对冲上的部分已吃单减掉",
+                elapsed_ms=(self.clock() - started) * 1000,
+                notes=notes, ledger=ledger,
+            )
+        return PairResult(
+            False, "close_wait",
+            self._last(run.lighter_legs, "lighter") if run else None,
+            self._last(run.arcus_legs, "arcus") if run else None,
+            reason=f"挂 maker 已对冲 {hedged:g}，剩余不吃单，下一轮再挂",
+            elapsed_ms=(self.clock() - started) * 1000,
+            notes=notes + ["剩余仓位继续挂 maker，避免 Arcus 吃单费"],
+            ledger=ledger,
         )
-        rest.ledger = ledger + rest.ledger
-        rest.notes = notes + [f"挂单阶段平掉 {run.hedged if run else 0:g}，剩余吃单平"] + rest.notes
-        rest.elapsed_ms = (self.clock() - started) * 1000
-        return rest
 
     # ── 核心：挂单、盯成交、立刻对冲 ─────────────────
     async def _work(
@@ -524,12 +539,11 @@ class MakerExecutor:
         self, market: dict[str, Any], lighter_side: str, arcus_side: str,
         arcus_price: float, state: dict[str, Any],
     ) -> tuple[bool, str]:
-        """新挂或改价之前：重读 Lighter 对冲价，买价必须低于卖价且绝对价差不宽于阈值。"""
+        """新挂或改价之前：重读 Lighter 对冲价。买价必须严格低于卖价，不看 bp 宽度。"""
         if not await self._refresh_ref(market, lighter_side, state):
             return False, "读不到 Lighter 实时对冲价，不下单"
         ok, _bps, why = open_sides_allowed(
-            lighter_side, arcus_side, state["ref"], float(arcus_price),
-            self.ex.settings.max_spread_bps,
+            lighter_side, arcus_side, state["ref"], float(arcus_price), None,
         )
         return ok, why
 

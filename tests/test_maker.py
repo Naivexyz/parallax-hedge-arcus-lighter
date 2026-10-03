@@ -324,13 +324,15 @@ def test_a_full_maker_close_needs_no_taker_fallback():
     assert not hasattr(w, "taker_close")
 
 
-def test_what_the_maker_close_misses_is_closed_by_taker():
+def test_what_the_maker_close_misses_is_not_finished_by_taker():
+    """没平完的部分不吃单。已经成交的那一段仍然在 Lighter 对冲上。"""
     w = World(fills={2: 0.2})
     w.arcus, w.lighter = -0.5, 0.5
     ex, r = close_(w, wait=10)
-    assert r.ok
-    assert w.taker_close["lighter_size"] == pytest.approx(0.3)
-    assert w.taker_close["arcus_size"] == pytest.approx(-0.3)
+    assert r.ok is False and r.stage == "close_wait"
+    assert not hasattr(w, "taker_close")
+    assert w.lighter == pytest.approx(0.3)
+    assert w.arcus == pytest.approx(-0.3)
 
 
 # ── 签名 ────────────────────────────────────────────────
@@ -479,22 +481,19 @@ def test_open_does_not_quote_the_expensive_side():
     assert any("不下单" in n for n in r.notes)
 
 
-def test_eth_prints_do_not_post_long_the_expensive_venue():
-    """2026-10-03 ETH：打算 Lighter 多 / Arcus 空。
+def test_eth_prints_post_when_the_buy_is_cheaper_even_if_wide():
+    """买 Lighter 卖一 2662.56、卖 Arcus 2663.43，约 3.3 bp。买得更便宜就挂。
 
-    Lighter 对冲若去买，吃到的应是卖一。2662.56 是买一那种价，拿它当买价、
-    Arcus 卖价 2663.43，绝对价差约 3.3 bp，一张单都不能挂，也不能去对冲。
+    不再因为宽于 1 bp 拒绝。对冲仍然打卖一，不是买一。
     """
-    # 卖单挂价：卖一 2663.44、买一 2663.30，空档大于一档 → 2663.43
     w = World(bbo=(2663.30, 2663.44), lighter_bbo=(2662.40, 2662.56),
               fills={2: 0.1502})
     ex, r = open_(w, quantity=0.1502, wait=8)
-    assert r.ok is False
-    assert w.placed == []
-    assert w.lighter_orders == []
-    assert w.arcus == 0.0 and w.lighter == 0.0
-    assert any("不下单" in n for n in r.notes)
-    assert any("2662.56" in n and "2663.43" in n for n in r.notes)
+    assert r.ok and r.stage == "opened"
+    alo = [p for p in w.placed if p["tif"] == "ALO"]
+    assert alo and alo[0]["side"] == "sell" and alo[0]["price"] == pytest.approx(2663.43)
+    assert w.lighter_orders and w.lighter_orders[0][0] == "buy"
+    assert w.lighter == pytest.approx(0.1502) and w.arcus == pytest.approx(-0.1502)
 
 
 def test_a_requote_rechecks_the_live_lighter_hedge_and_still_hedges_a_fill():
@@ -505,7 +504,7 @@ def test_a_requote_rechecks_the_live_lighter_hedge_and_still_hedges_a_fill():
         bbo_script=[(2663.40, 2663.55), (2663.30, 2663.44)],
         lighter_bbo=(2663.20, 2663.40),
         # 第一口挂单、挂上之后立刻复查，这两次都还是好价；成交之后才变成坏价。
-        lighter_bbo_script=[(2663.20, 2663.40), (2663.20, 2663.40), (2662.40, 2662.56)],
+        lighter_bbo_script=[(2663.20, 2663.40), (2663.20, 2663.40), (2664.00, 2664.20)],
         fills={2: 0.1502},
     )
     ex, r = open_(w, quantity=0.3004, wait=12)
@@ -519,7 +518,7 @@ def test_a_requote_rechecks_the_live_lighter_hedge_and_still_hedges_a_fill():
     assert w.lighter == pytest.approx(0.1502)
     assert w.arcus == pytest.approx(-0.1502)
     assert r.ok
-    assert any("2662.56" in n and "2663.43" in n for n in r.notes)
+    assert any("不下单" in n for n in r.notes)
 
 
 def test_a_tight_book_still_buys_the_cheaper_lighter_ask():
@@ -548,8 +547,8 @@ def test_several_rejected_quotes_are_not_followed_by_a_place():
     买价不低于卖价，或者绝对价差宽于 1 bp，都是拒绝。拒绝理由可以记下来，
     但后面不能跟着一张 Arcus 挂单，更不能去 Lighter 对冲。
     """
-    # 四口都过不了闸：前三口买得比卖贵，最后一口便宜但宽于 1 bp。
-    # 成交脚本如果挂单还活着就会打满 —— 用来抓住「拒绝了却仍然留单」。
+    # 四口都是买价不低于卖价。最后一口以前因为「便宜但宽于 1 bp」被拒，
+    # 宽度不再拦截，所以这里改成方向也不对，确认拒绝之后不会留单。
     w = World(
         bbo=(2686.50, 2686.70),
         bbo_script=[
@@ -563,7 +562,7 @@ def test_several_rejected_quotes_are_not_followed_by_a_place():
             (2686.20, 2686.30),
             (2685.00, 2685.10),
             (2684.40, 2684.50),
-            (2685.20, 2685.30),
+            (2683.50, 2683.60),
         ],
         fills={2: 0.5, 3: 0.5, 4: 0.5, 6: 0.5, 8: 0.5},
     )

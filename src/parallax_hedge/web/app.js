@@ -330,7 +330,7 @@ function fillSettings(snapshot) {
   if (!$('f-min-hold')) return;
   $('f-min-hold').value = snapshot.min_hold_sec ?? 3;
   $('f-max-hold').value = snapshot.max_hold_sec ?? 300;
-  $('f-spread-bps').value = snapshot.max_spread_bps ?? 1;
+  $('f-pnl-usd').value = snapshot.pnl_close_usd ?? 0.02;
   if ($('f-cycle')) {
     $('f-cycle').value = snapshot.engine_cycle_seconds ?? snapshot.cycle_seconds ?? 20;
   }
@@ -373,7 +373,7 @@ function planChip(plan, urgent) {
                 adopt: ['hold', '接管'], ledger: ['off', '账本'], rebase: ['off', '基准重设'],
                 maker_wait: ['off', '未成交'], maker_started: ['hold', '挂单中'],
                 maker_busy: ['hold', '挂单中'],
-                spread_wait: ['hold', '价差等待'], close_wait: ['hold', '等待平仓价差'],
+                spread_wait: ['hold', '价差等待'], close_wait: ['hold', '等待平仓'],
                 topup: ['on', '已补仓'], topup_failed: ['urgent', '补仓失败'],
                 topup_stop: ['hold', '叫停补仓'],
                 error: ['urgent', '出错'] };
@@ -395,13 +395,13 @@ async function loadTasks() {
     renderUnmanaged(t.unmanaged);
     const banner = $('dry-banner');
     banner.className = 'dry-banner' + (t.dry_run ? '' : ' live');
-    const gateNote = ` <b>价差闸门已开启</b>：开仓、补仓只在买价严格低于卖价、且绝对价差不超过 ${esc(t.max_spread_bps ?? 1)} bp 时两边一起挂 maker`
-      + `（买更便宜的一边、卖更贵的一边）。这个宽度只约束开仓，不约束平仓。`
-      + `某一个所可以一直更贵，不要等价差回到 0。`
-      + `两腿都成交后至少持有 ${esc(t.min_hold_sec ?? 3)} 秒；之后只要平仓是买便宜的一边、卖贵的一边，就立即挂 maker，多宽都平，不等缺口缩回开仓阈值。`
-      + `平仓如果会买到更贵的一边，就不提前平。`
-      + `<b>持有满 ${esc(t.max_hold_sec ?? 300)} 秒仍未平掉就强制平仓，不再等价差。</b>`
-      + `同一套规则用于面板里已有的全部重叠市场，包括美股永续，不单限 BTC、ETH。风控平仓仍立刻吃单。`;
+    const gateNote = ` <b>开仓</b>：买更便宜的一边、卖更贵的一边。买价必须严格低于卖价，不再用价差 bp 阈值。`
+      + `Arcus 先挂 maker（0 费），Lighter 对冲（吃单或挂单都是 0 费）。方向反了的单不会发出。`
+      + `两腿都成交后至少持有 ${esc(t.min_hold_sec ?? 3)} 秒。`
+      + `之后两边浮盈亏合计不低于 -${esc(t.pnl_close_usd ?? 0.02)} USDC 就挂 maker 平（合计 0，或正好差这么多，都平；更差就等）。`
+      + `<b>持有满 ${esc(t.max_hold_sec ?? 300)} 秒仍未平掉就强制挂 maker 平，不再看浮盈亏。</b>`
+      + `平仓不改吃单，免得 Arcus 付吃单费。已经成交的一条腿仍然会对冲。`
+      + `同一套规则用于全部重叠市场，包括美股永续。风控平仓仍立刻吃单。`;
     banner.innerHTML = t.dry_run
       ? `<b>演练模式</b> —— 引擎照常做全部判断并记录意图，但<b>不会提交任何订单</b>。`
         + (t.maker ? ` 挂单模式已开（演练里仍按吃单模拟成交）。` : '')
@@ -431,7 +431,7 @@ async function loadTasks() {
           return `<div class="task-row">
             <div><b>${esc(task.asset)}</b></div>
             <div>${esc(task.leverage)}×<div class="muted">杠杆</div></div>
-            <div>${clock}<div class="muted">平仓扫描 · 价差有利即平</div></div>
+            <div>${clock}<div class="muted">平仓扫描 · 浮盈亏差额 ${esc(t.pnl_close_usd ?? 0.02)} U</div></div>
             <div>${esc(held)}<div class="muted">${task.open_direction ? esc(task.open_direction.startsWith('long') ? 'Lighter 多' : 'Lighter 空') : '当前持仓'}</div></div>
             <div>${task.corridor_at_open ? fmt(task.corridor_at_open, 2) + '%' : '—'}<div class="muted">开仓走廊</div></div>
             <div>${d ? planChip(d.plan, d.urgent) : ''}<div class="muted" title="${esc(d?.reason || '')}">${esc((d?.reason || '').slice(0, 40))}</div></div>
@@ -471,20 +471,20 @@ document.addEventListener('click', async (ev) => {
 $('f-save').addEventListener('click', async () => {
   const minHold = Number($('f-min-hold').value);
   const maxHold = Number($('f-max-hold').value);
-  const spread = Number($('f-spread-bps').value);
+  const pnlUsd = Number($('f-pnl-usd').value);
   const cycle = Number($('f-cycle').value);
   if (!Number.isFinite(minHold) || minHold < 0) { alert('两腿成交后开始扫描的秒数不能小于 0'); return; }
   if (!Number.isFinite(maxHold) || maxHold < minHold) {
     alert(`最长持有 ${maxHold} 秒不能小于开始扫描的 ${minHold} 秒`); return;
   }
-  if (!Number.isFinite(spread) || spread < 0) { alert('价差阈值必须是大于等于 0 的数字，可以有小数，例如 1.1'); return; }
+  if (!Number.isFinite(pnlUsd) || pnlUsd < 0) { alert('浮盈亏差额必须是大于等于 0 的数字，单位 USDC，例如 0.02'); return; }
   if (!Number.isFinite(cycle) || cycle < 5) { alert('开仓扫描间隔不能小于 5 秒'); return; }
   const settingsRes = await fetch('/api/settings', { method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       min_hold_sec: minHold,
       max_hold_sec: maxHold,
-      max_spread_bps: spread,
+      pnl_close_usd: pnlUsd,
       engine_cycle_seconds: cycle,
     }) });
   if (!settingsRes.ok) { alert((await settingsRes.json()).detail || '设置保存失败'); return; }
@@ -505,7 +505,7 @@ $('f-save').addEventListener('click', async () => {
 
 ['f-leverage', 'f-notional'].forEach((id) =>
   $(id).addEventListener('input', () => { formTouched = true; }));
-['f-min-hold', 'f-max-hold', 'f-spread-bps', 'f-cycle'].forEach((id) =>
+['f-min-hold', 'f-max-hold', 'f-pnl-usd', 'f-cycle'].forEach((id) =>
   $(id).addEventListener('input', () => { settingsTouched = true; }));
 $('f-asset').addEventListener('change', () => { formTouched = false; loadTasks(); });
 

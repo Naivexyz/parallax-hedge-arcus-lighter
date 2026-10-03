@@ -25,11 +25,11 @@ MARKET = {
 }
 
 
-def row(lighter_size=0.0, arcus_size=0.0, mark=210.0):
-    def leg(size, liq):
+def row(lighter_size=0.0, arcus_size=0.0, mark=210.0, lighter_pnl=0.0, arcus_pnl=0.0):
+    def leg(size, liq, pnl):
         return {"size": size, "entry_price": mark, "mark_price": mark,
                 "liquidation_price": liq if size else None,
-                "unrealized_pnl": 0.0, "margin": 10.0}
+                "unrealized_pnl": pnl, "margin": 10.0}
     return {
         "asset": "OAI", "lighter_symbol": "OPENAI", "arcus_symbol": "OAI-USD",
         "lighter_bps_per_hour": 0.04, "arcus_bps_per_hour": 0.424,
@@ -37,8 +37,8 @@ def row(lighter_size=0.0, arcus_size=0.0, mark=210.0):
         "direction_label": "Lighter 多 / Arcus 空", "tradable": True, "reason": None,
         "mark_price": mark,
         "position": {
-            "lighter": leg(lighter_size, mark * 0.9),
-            "arcus": leg(arcus_size, mark * 1.1),
+            "lighter": leg(lighter_size, mark * 0.9, lighter_pnl),
+            "arcus": leg(arcus_size, mark * 1.1, arcus_pnl),
         },
     }
 
@@ -51,17 +51,16 @@ class FakeClient:
     async def lighter_book(self, market_id, symbol, limit=100):
         from parallax_hedge.books import Book, Level
         mark = self.row.get("mark_price") or 210.0
-        # 卖一价差约 0.3 bp。100 USDC 这种便宜币上 0.01 的一档大约就是 1 bp，
-        # 买一必须贴着卖一，挂单价差才不会被档位取整撑过 MAX_SPREAD_BPS。
-        # Lighter 卖一更便宜，闸门保持「Lighter 多」。
+        # Lighter 卖一低于 Arcus 买一：买 Lighter、卖 Arcus，买价严格更便宜。
+        # 不再靠「绝对价差小于 1 bp」把买贵卖便宜放过去。
         return Book(venue="lighter", symbol=symbol,
-                    bids=[Level(mark * 1.00000, 50)], asks=[Level(mark * 1.00002, 50)])
+                    bids=[Level(mark * 1.00000, 50)], asks=[Level(mark * 1.00001, 50)])
 
     async def arcus_book(self, symbol):
         from parallax_hedge.books import Book, Level
         mark = self.row.get("mark_price") or 210.0
         return Book(venue="arcus", symbol=symbol,
-                    bids=[Level(mark * 0.99999, 50)], asks=[Level(mark * 1.00005, 50)])
+                    bids=[Level(mark * 1.00003, 50)], asks=[Level(mark * 1.00006, 50)])
     async def lighter_account(self):
         return {"accounts": [{"account_index": 77, "available_balance": "300"}]}
     async def arcus_account(self):
@@ -514,12 +513,12 @@ def test_after_min_hold_a_tight_spread_is_maker_closed():
                           opened_at=time.time() - 4, corridor_at_open=8.3,
                           open_direction="long_lighter_short_arcus", open_quantity=0.2)
         d = run(eng.run_cycle())
-        assert d[0]["plan"] == "close" and "价差有利" in d[0]["reason"]
+        assert d[0]["plan"] == "close" and "浮盈亏" in d[0]["reason"]
         assert "不超过" not in d[0]["reason"]
         assert "Lighter" in d[0]["reason"] and "Arcus" in d[0]["reason"]
         assert store.get_task("OAI")["opened_at"] is None
         logged = store.recent_cycles()[0]
-        assert "价差有利" in logged["reason"] and "不超过" not in logged["reason"]
+        assert "浮盈亏" in logged["reason"] and "不超过" not in logged["reason"]
         assert "Lighter" in logged["reason"] and "Arcus" in logged["reason"]
 
 
@@ -545,29 +544,51 @@ def test_after_min_hold_a_wide_favorable_spread_is_maker_closed():
                           opened_at=time.time() - 4, corridor_at_open=8.3,
                           open_direction="long_lighter_short_arcus", open_quantity=0.2)
         d = run(eng.run_cycle())
-        assert d[0]["plan"] == "close" and "价差有利" in d[0]["reason"]
+        assert d[0]["plan"] == "close" and "浮盈亏" in d[0]["reason"]
         assert "不超过" not in d[0]["reason"]
         assert "211.2" in d[0]["reason"] and "210" in d[0]["reason"]
         assert store.get_task("OAI")["opened_at"] is None
 
 
-def test_after_min_hold_a_wide_spread_waits_instead_of_closing():
-    """宽，但是平仓会买更贵的一边：不是「价差还没回到 0」，而是方向不利，所以继续持有。"""
-    with tempfile.TemporaryDirectory() as tmp:
-        eng, store, _ = make(tmp, row(0.2, -0.2))
+def test_net_pnl_window_closes_after_min_hold_and_waits_when_worse():
+    """差额 0.02：合计 -0.02 在最短持有后挂 maker 平；-0.05 在最长持有前不平。"""
+    def once(net, age):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng, store, _ = make(
+                tmp, row(0.2, -0.2, lighter_pnl=net, arcus_pnl=0.0), dry_run=False,
+            )
+            eng.settings.pnl_close_usd = 0.02
+            spy = CloseSpy()
+            eng.executor = spy
+            store.upsert_task(
+                "OAI", enabled=1, leverage=6.0, rotation_hours=4.0,
+                opened_at=time.time() - age, corridor_at_open=8.3,
+                open_direction="long_lighter_short_arcus", open_quantity=0.2,
+            )
+            d = run(eng.run_cycle())
+            if d[0]["plan"] == "maker_started":
+                _drain(eng)
+            return d, spy.calls, store.get_task("OAI"), store.recent_cycles()
 
-        async def wide_arcus(symbol):
-            from parallax_hedge.books import Book, Level
-            return Book(venue="arcus", symbol=symbol,
-                        bids=[Level(210.20, 50)], asks=[Level(210.30, 50)])
+    closed, calls, task, _cycles = once(-0.02, 4)
+    assert calls and calls[0][0] == "place_maker_pair"
+    assert calls[0][1]["action"] == "close" and calls[0][1]["reduce_only"] is True
+    assert task["opened_at"] is None
+    assert "浮盈亏" in closed[0]["reason"]
 
-        eng.service.client.arcus_book = wide_arcus
-        store.upsert_task("OAI", enabled=1, leverage=6.0, rotation_hours=4.0,
-                          opened_at=time.time() - 4, corridor_at_open=8.3,
-                          open_direction="long_lighter_short_arcus", open_quantity=0.2)
-        d = run(eng.run_cycle())
-        assert d[0]["result"]["stage"] == "close_wait"
-        assert store.get_task("OAI")["opened_at"] is not None
+    waiting, calls, task, cycles = once(-0.05, 30)
+    assert calls == []
+    assert task["opened_at"] is not None
+    assert waiting[0]["plan"] == "idle"
+    assert "先不平" in waiting[0]["reason"]
+    assert cycles == [] or cycles[0]["plan"] != "close"
+
+    forced, calls, task, cycles = once(-0.05, 301)
+    assert calls and calls[0][0] == "place_maker_pair"
+    assert all(name != "close_pair" for name, _ in calls)
+    assert task["opened_at"] is None
+    assert "强制" in forced[0]["reason"]
+    assert any("强制" in (c["reason"] or "") for c in cycles)
 
 
 def test_max_hold_closes_even_when_the_spread_is_wide():
@@ -585,8 +606,8 @@ def test_max_hold_closes_even_when_the_spread_is_wide():
                           opened_at=time.time() - 301, corridor_at_open=8.3,
                           open_direction="long_lighter_short_arcus", open_quantity=0.2)
         d = run(eng.run_cycle())
-        assert d[0]["plan"] == "close" and "强制平仓" in d[0]["reason"]
-        assert d[0]["urgent"] is True
+        assert d[0]["plan"] == "close" and "强制" in d[0]["reason"]
+        assert d[0]["urgent"] is False
         assert store.get_task("OAI")["opened_at"] is None
 
 
@@ -969,17 +990,20 @@ def test_maker_mode_opens_through_the_maker_and_records_the_filled_size():
         assert store.get_task("OAI")["open_quantity"] == pytest.approx(1.5)   # 实际成交的量
 
 
-def test_max_hold_forces_a_taker_close_instead_of_waiting_for_a_maker():
-    """持有已超过 300 秒：强制吃单平，不能再挂着等价差。"""
+def test_max_hold_forces_a_maker_close_instead_of_a_taker():
+    """持有已超过 300 秒：强制挂 maker 平，不改吃单，免得 Arcus 付吃单费。"""
     with tempfile.TemporaryDirectory() as tmp:
-        eng, store, _ = make(tmp, row(0.2, -0.2), dry_run=False)
+        eng, store, _ = make(tmp, row(0.2, -0.2, lighter_pnl=-1.0), dry_run=False)
         eng.executor = SpyExecutor(close_result=PairResult(True, "closed"))
         calls = _with_maker(eng)
         store.upsert_task("OAI", enabled=1, leverage=6.0, rotation_hours=4.0,
-                          opened_at=time.time() - 5 * 3600, corridor_at_open=8.3)
+                          opened_at=time.time() - 5 * 3600, corridor_at_open=8.3,
+                          open_direction="long_lighter_short_arcus", open_quantity=0.2)
         d = run(eng.run_cycle())
-        assert d[0]["plan"] == "close" and d[0]["urgent"] is True
-        assert [n for n, _ in calls] == ["close_pair"]
+        assert d[0]["plan"] == "maker_started" and "强制" in d[0]["reason"]
+        assert d[0]["urgent"] is False
+        _drain(eng)
+        assert [n for n, _ in calls] == ["maker_close"]
         assert store.get_task("OAI")["opened_at"] is None
 
 
@@ -1141,10 +1165,19 @@ def test_nothing_to_top_up_once_the_target_is_reached():
 def test_no_top_up_once_max_hold_forces_a_close():
     with tempfile.TemporaryDirectory() as tmp:
         eng, store, _ = _holding(tmp, held=301)
-        eng._maker = lambda stop=None: TopupMaker(eng.executor.calls)
+        calls = eng.executor.calls
+
+        class Closing(TopupMaker):
+            async def close_pair(self, **kw):
+                calls.append(("maker_close", kw))
+                return PairResult(True, "closed", ledger=[])
+
+        eng._maker = lambda stop=None: Closing(calls)
         d = run(eng.run_cycle())
-        assert d[0]["plan"] == "close" and "强制平仓" in d[0]["reason"]
-        assert [n for n, _ in eng.executor.calls] == ["close_pair"]
+        assert d[0]["plan"] == "maker_started" and "强制" in d[0]["reason"]
+        _drain(eng)
+        assert [n for n, _ in calls] == ["maker_close"]
+        assert store.get_task("OAI")["opened_at"] is None
 
 
 def test_positions_without_a_recorded_target_use_the_notional_cap():
@@ -1228,8 +1261,8 @@ def test_a_healthy_top_up_is_left_running():
         assert [n for n, _ in calls] == ["maker_open"]
 
 
-def test_the_three_live_expensive_books_do_not_open():
-    """ETH / SOL / ZEC 实盘那三笔的盘口：买贵卖便宜，引擎不得开仓。"""
+def test_the_three_live_books_open_the_cheaper_side_even_when_wide():
+    """那三笔盘口价差都宽于 1 bp，但买便宜的一边仍然开。反方向的成交价由闸门拒绝。"""
     books = (
         (2652.90, 2652.97, 2654.44, 2654.51),
         (117.6700, 117.6800, 117.7580, 117.7700),
@@ -1253,9 +1286,11 @@ def test_the_three_live_expensive_books_do_not_open():
             eng.service.client.arcus_book = arcus_book
             store.upsert_task("OAI", enabled=1, leverage=6.0, rotation_hours=4.0)
             d = run(eng.run_cycle())
-            assert d[0]["result"]["stage"] == "spread_wait"
-            assert store.get_task("OAI")["opened_at"] is None
-            assert store.recent_cycles()[0]["plan"] == "spread_wait"
+            assert d[0]["plan"] == "open", d[0]
+            task = store.get_task("OAI")
+            assert task["opened_at"] is not None
+            cheap = "long_lighter_short_arcus" if la < aa else "short_lighter_long_arcus"
+            assert task["open_direction"] == cheap
 
 
 def _override_books(eng, lighter_bid, lighter_ask, arcus_bid, arcus_ask):
@@ -1320,27 +1355,25 @@ def test_favorable_close_wider_than_the_threshold_is_sent_before_max_hold():
         assert store.get_task("OAI")["opened_at"] is None
         logged = store.recent_cycles()[0]
         assert logged["plan"] == "close"
-        assert "价差有利" in logged["reason"]
+        assert "浮盈亏" in logged["reason"]
         assert "不超过" not in logged["reason"]
         assert "210.06" in logged["reason"] and "209.99" in logged["reason"]
 
 
-def test_unfavorable_close_wider_than_the_threshold_waits_for_max_hold():
-    """平仓买价高于卖价，而且宽于阈值：最长持有之前不发平仓单。"""
+def test_a_loss_worse_than_the_window_does_not_close_before_max_hold():
+    """合计 -0.05、差额 0.02：盘口再有利也不提前平。"""
     with tempfile.TemporaryDirectory() as tmp:
-        eng, store, _ = make(tmp, row(0.2, -0.2), dry_run=False)
+        eng, store, _ = make(
+            tmp, row(0.2, -0.2, lighter_pnl=1.0, arcus_pnl=-1.05), dry_run=False,
+        )
+        eng.settings.pnl_close_usd = 0.02
         spy = CloseSpy()
         eng.executor = spy
-        _override_books(eng, 209.99, 210.00, 210.06, 210.07)
+        _override_books(eng, 210.05, 210.06, 209.99, 210.00)
         store.upsert_task("OAI", enabled=1, leverage=6.0, rotation_hours=4.0,
                           opened_at=time.time() - 30, corridor_at_open=8.3,
                           open_direction="long_lighter_short_arcus", open_quantity=0.2)
         d = run(eng.run_cycle())
-        # 实盘 maker 平仓先丢到后台，闸门在任务里拒绝，不会把单发出去。
-        assert d[0]["plan"] == "maker_started"
-        _drain(eng)
+        assert d[0]["plan"] == "idle" and "先不平" in d[0]["reason"]
         assert spy.calls == []
         assert store.get_task("OAI")["opened_at"] is not None
-        logged = store.recent_cycles()[0]
-        assert logged["plan"] == "close_wait"
-        assert "不低于" in logged["reason"]

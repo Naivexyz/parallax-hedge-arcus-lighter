@@ -90,15 +90,17 @@ class Settings:
     order_slippage_bps: float = 10.0
     # 挂单模式：Arcus 那条腿挂 ALO（0 手续费），成交后去 Lighter 吃单对冲
     arcus_maker: bool = False
-    # 挂单最多等多久（秒）。开仓等不到就撤单下轮再挂；平仓等不到剩余部分改吃单
+    # 挂单最多等多久（秒）。开仓等不到就撤单下轮再挂；平仓没挂完的剩余下一轮再挂 maker
     maker_wait_seconds: float = 120.0
-    # 只约束开仓和补仓：买价必须严格低于卖价，且绝对价差不超过这么多 bp。默认 1。
-    # 计划内平仓不看这个数。某一个所可以一直更贵，不要等价差回到 0。
+    # 旧的价差 bp 阈值。不再用来决定开仓或平仓，面板和设置接口也不再读写它。
     max_spread_bps: float = 1.0
-    # 两腿都成交之后，至少持有这么多秒，才允许平仓（包括价差有利的平仓）。
+    # 两腿都成交之后，至少持有这么多秒，才允许按浮盈亏平仓。
     min_hold_sec: float = 3.0
-    # 从两腿都成交起超过这么多秒仍持仓，不再等价差，强制平仓。
+    # 从两腿都成交起超过这么多秒仍持仓，不管浮盈亏，强制挂 maker 平仓。
     max_hold_sec: float = 300.0
+    # 浮盈亏差额（USDC）。最短持有之后，两边浮盈亏合计不低于 -这个数就挂 maker 平。
+    # 0.02：合计 0 或 -0.02 平，比 -0.02 更差先不平。
+    pnl_close_usd: float = 0.02
     # 演练模式：只记录意图，不提交任何订单
     dry_run: bool = True
     # 引擎多久跑一个周期
@@ -185,6 +187,7 @@ class Settings:
             max_spread_bps=_num(raw.get("MAX_SPREAD_BPS"), 1.0),
             min_hold_sec=_num(raw.get("MIN_HOLD_SEC"), 3.0),
             max_hold_sec=_num(raw.get("MAX_HOLD_SEC"), 300.0),
+            pnl_close_usd=_num(raw.get("PNL_CLOSE_USD"), 0.02),
             engine_cycle_seconds=_num(raw.get("ENGINE_CYCLE_SECONDS"), 20.0),
             _raw=raw,
         )

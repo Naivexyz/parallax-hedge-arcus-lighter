@@ -204,9 +204,9 @@ def create_app(settings: Settings) -> FastAPI:
             "maker_wait_seconds": settings.maker_wait_seconds,
             "cycle_seconds": settings.engine_cycle_seconds,
             "engine_cycle_seconds": settings.engine_cycle_seconds,
-            "max_spread_bps": settings.max_spread_bps,
             "min_hold_sec": settings.min_hold_sec,
             "max_hold_sec": settings.max_hold_sec,
+            "pnl_close_usd": settings.pnl_close_usd,
             "spread_gate": True,
             "busy": engine.busy_assets(),
             "bell": app.state.bell.stats() if app.state.bell is not None else None,
@@ -217,17 +217,17 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.post("/api/settings")
     async def update_runtime_settings(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-        """面板上的持仓时钟、价差阈值和开仓扫描间隔。
+        """面板上的持仓时钟、浮盈亏差额和开仓扫描间隔。
 
         引擎、执行器每轮读的都是这同一个 Settings 对象，所以改完下一轮就生效，
         不用重启进程。开仓扫描间隔由引擎循环每轮读取 settings.engine_cycle_seconds
         （不是启动时抄下来的局部变量），实际休眠不会短于 5 秒。
-        买价仍必须严格低于卖价，这条不在这里放宽。
+        开仓买价仍必须严格低于卖价。不再接受、也不再要求 max_spread_bps。
         """
         labels = {
             "min_hold_sec": "最短持有",
             "max_hold_sec": "最长持有",
-            "max_spread_bps": "价差阈值",
+            "pnl_close_usd": "浮盈亏差额",
             "engine_cycle_seconds": "开仓扫描间隔",
         }
         if not any(key in payload for key in labels):
@@ -247,7 +247,7 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(400, "没有要更新的设置")
         min_hold = parsed.get("min_hold_sec", float(settings.min_hold_sec))
         max_hold = parsed.get("max_hold_sec", float(settings.max_hold_sec))
-        spread = parsed.get("max_spread_bps", float(settings.max_spread_bps))
+        pnl_window = parsed.get("pnl_close_usd", float(settings.pnl_close_usd))
         cycle = parsed.get("engine_cycle_seconds", float(settings.engine_cycle_seconds))
         if min_hold < 0:
             raise HTTPException(400, "最短持有不能小于 0 秒")
@@ -255,26 +255,26 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(
                 400, f"最长持有 {max_hold:g} 秒不能小于最短 {min_hold:g} 秒"
             )
-        if spread < 0:
-            raise HTTPException(400, "价差阈值不能小于 0")
+        if pnl_window < 0:
+            raise HTTPException(400, "浮盈亏差额不能小于 0")
         # 只在这次真的要改间隔时卡 5 秒。循环本身是 max(5, ...)，
         # 但面板不能存一个引擎实际做不到的更短间隔。已有的更小值不拦其它字段的保存。
         if "engine_cycle_seconds" in parsed and cycle < 5:
             raise HTTPException(400, "开仓扫描间隔不能小于 5 秒")
         settings.min_hold_sec = min_hold
         settings.max_hold_sec = max_hold
-        settings.max_spread_bps = spread
+        settings.pnl_close_usd = pnl_window
         settings.engine_cycle_seconds = cycle
         persisted = update_env_values(settings.env_path, {
             "MIN_HOLD_SEC": format_env_number(min_hold),
             "MAX_HOLD_SEC": format_env_number(max_hold),
-            "MAX_SPREAD_BPS": format_env_number(spread),
+            "PNL_CLOSE_USD": format_env_number(pnl_window),
             "ENGINE_CYCLE_SECONDS": format_env_number(cycle),
         })
         return {
             "min_hold_sec": settings.min_hold_sec,
             "max_hold_sec": settings.max_hold_sec,
-            "max_spread_bps": settings.max_spread_bps,
+            "pnl_close_usd": settings.pnl_close_usd,
             "engine_cycle_seconds": settings.engine_cycle_seconds,
             "restart_required": False,
             "persisted": persisted,

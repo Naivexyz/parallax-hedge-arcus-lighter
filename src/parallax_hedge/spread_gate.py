@@ -1,14 +1,14 @@
-"""Arcus 与 Lighter 的可执行价差闸门。
+"""Arcus 与 Lighter 的开仓方向闸门，以及平仓用的浮盈亏差额。
 
-开仓、补仓：绝对价差不超过 MAX_SPREAD_BPS（默认 1 bp）才允许挂 maker。
-方向：买更便宜的卖一，卖更贵的买一，而且两条腿必须在不同的所。
+开仓、补仓：买更便宜的一边，卖更贵的一边。买价必须严格低于卖价。
+不再用绝对价差多少 bp 决定开不开。宽，但买得更便宜，仍然开。
 
-计划内平仓不看这个绝对值。平仓买价低于卖价（价差有利、在收价差）就立刻挂 maker，
-差多少 bp 都平；买价不低于卖价（要付价差）就不提前平，一直持有到最长持有时间。
-最短持有（两腿都成交之后）仍然先拦住，包括有利的平仓。
+计划内平仓不看价差，也不看 bp。两腿都成交并过了最短持有之后，
+看两边浮盈亏加总：不低于「负的浮盈亏差额」就挂 maker 平。
+差额 0.02 时，合计 0、-0.02 都平，-0.05 先不平。持满最长持有仍强制平。
+平仓挂 maker，不因为价差方向把单撤掉。风控触发的平仓仍然立刻吃单。
 
-闸门不挑币种：面板里已经能交易的重叠市场都走同一套，包括美股永续，不单限 BTC、ETH。
-风控触发的平仓和持满后的强制平仓不走这里 —— 那两条路必须立刻吃单。
+闸门不挑币种：面板里已经能交易的重叠市场都走同一套，包括美股永续。
 """
 from __future__ import annotations
 
@@ -66,13 +66,13 @@ def hedge_take_price(book: Book, side: str) -> float | None:
     return float(price)
 
 
-def evaluate_books(lighter: Book, arcus: Book, max_bps: float) -> SpreadGate:
-    """用卖一买一量跨所价差。绝对值不超过 max_bps 才算通过。
+def evaluate_books(lighter: Book, arcus: Book, max_bps: float | None = None) -> SpreadGate:
+    """用卖一买一量跨所方向。买价必须严格低于卖价才算通过。
 
     可执行价差 = 便宜那边的卖一 − 贵那边的买一。
-    正数是买价高于卖价（要付价差），负数是两边已经交叉。
-    阈值看绝对值：离 0 超过 MAX_SPREAD_BPS 就不开仓。
-    计划内平仓不走这里，改看平仓两边的买价和卖价谁更便宜。
+    买价不低于卖价就不开。价差有多宽（多少 bp）不再拦截。
+    max_bps 保留参数只是为了旧调用方，不参与判断。
+    计划内平仓不走这里，改看两边浮盈亏合计。
     """
     lighter_bid, lighter_ask = lighter.best_bid, lighter.best_ask
     arcus_bid, arcus_ask = arcus.best_bid, arcus.best_ask
@@ -98,21 +98,22 @@ def evaluate_books(lighter: Book, arcus: Book, max_bps: float) -> SpreadGate:
         return SpreadGate(False, "价差中价无效，本轮不下单")
     gap_bps = gap_usd / mid * 10_000.0
     abs_bps = abs(gap_bps)
-    limit = float(max_bps)
     fields = dict(
         direction=direction, gap_bps=gap_bps, abs_gap_bps=abs_bps, gap_usd=gap_usd,
         long_venue=long_venue, short_venue=short_venue,
         long_ask=long_ask, short_bid=short_bid,
     )
-    if abs_bps > limit + 1e-9:
+    if long_ask >= short_bid:
         return SpreadGate(
             False,
-            f"跨所价差 {abs_bps:.2f} bp，宽于 {limit:g} bp，先不开仓",
+            f"买价 {long_ask:g} 不低于卖价 {short_bid:g}（{gap_bps:.2f} bp），"
+            f"这是贵的一边，本轮不下单",
             **fields,
         )
     return SpreadGate(
         True,
-        f"跨所价差 {abs_bps:.2f} bp，不超过 {limit:g} bp，买{long_name}、卖{short_name}",
+        f"买{long_name} {long_ask:g}、卖{short_name} {short_bid:g}"
+        f"（价差 {abs_bps:.2f} bp，不看 bp 阈值）",
         **fields,
     )
 
@@ -129,13 +130,11 @@ def buy_sell_prices(
 
 
 def order_prices_allowed(
-    buy_price: float, sell_price: float, max_bps: float,
+    buy_price: float, sell_price: float, max_bps: float | None = None,
 ) -> tuple[bool, float | None, str]:
     """开仓 / 补仓发出去之前的最后一道检查，用的是即将成交的挂单价，不是卖一。
 
-    gap = buy_price - sell_price，bps = gap / mid * 10000。
-    买价不低于卖价，或者绝对价差宽于 max_bps，都不许发单。
-    正好等于 max_bps 允许（和 evaluate_books 同一条边界）。
+    买价必须严格低于卖价。绝对价差多少 bp 不再拦截，max_bps 不参与判断。
     """
     try:
         buy = float(buy_price)
@@ -152,12 +151,10 @@ def order_prices_allowed(
         return False, bps, (
             f"买价 {buy:g} 不低于卖价 {sell:g}（{bps:.2f} bp），这是贵的一边，不下单"
         )
-    limit = float(max_bps)
-    if abs(bps) > limit + 1e-9:
-        return False, bps, (
-            f"买价 {buy:g} 与卖价 {sell:g} 相差 {abs(bps):.2f} bp，宽于 {limit:g} bp，不下单"
-        )
-    return True, bps, f"挂单价差 {abs(bps):.2f} bp，买更便宜的一边、卖更贵的一边"
+    return True, bps, (
+        f"买价 {buy:g} 低于卖价 {sell:g}（{abs(bps):.2f} bp），"
+        f"不看 bp 阈值，买更便宜的一边、卖更贵的一边"
+    )
 
 
 def open_sides_allowed(
@@ -171,15 +168,30 @@ def open_sides_allowed(
     return order_prices_allowed(prices[0], prices[1], max_bps)
 
 
+def unrealized_close_ready(net_pnl: float, window_usd: float) -> bool:
+    """最短持有之后，两腿浮盈亏合计是否可以挂 maker 平。
+
+    window 是面板上的「浮盈亏差额」（USDC）。合计不低于 -window 就平。
+    差额 0.02：合计 0 平，-0.02 平，-0.05 先不平。持满最长持有不走这里。
+    """
+    try:
+        net = float(net_pnl)
+        window = float(window_usd)
+    except (TypeError, ValueError):
+        return False
+    if net != net or window != window or net in (float("inf"), float("-inf")):
+        return False
+    if window < 0:
+        window = 0.0
+    return net + 1e-9 >= -window
+
+
 def close_prices_allowed(
     buy_price: float, sell_price: float,
 ) -> tuple[bool, float | None, str]:
-    """计划内平仓：只看这一次平仓是在收价差还是在付价差。
+    """旧的平仓价差方向检查。计划内平仓不再用它决定平不平。
 
-    买价 < 卖价：有利。买更便宜的一边、卖更贵的一边。无论多少 bp 都立刻挂 maker。
-    不看 MAX_SPREAD_BPS，不等缺口缩回开仓阈值，也不等价差回到 0。
-    某一个所一直更贵，是马上平的理由，不是继续等的理由。
-    买价 >= 卖价：不利，要付价差（或平价）。不许提前平，只在最长持有后强制平仓。
+    保留函数是为了对照历史成交。新的平仓看 unrealized_close_ready。
     """
     try:
         buy = float(buy_price)

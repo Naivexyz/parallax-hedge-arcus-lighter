@@ -94,7 +94,7 @@ def test_stats_endpoint_shape():
 
 
 def test_panel_settings_update_the_running_engine_without_a_restart():
-    """四个数写进引擎正在读的 Settings。下一轮就用新值，进程不用重启。"""
+    """持仓时钟、浮盈亏差额和扫描间隔写进引擎正在读的 Settings。下一轮就用，不用重启。"""
     import inspect
 
     from parallax_hedge.api import create_app
@@ -110,47 +110,50 @@ def test_panel_settings_update_the_running_engine_without_a_restart():
         body = run(update({
             "min_hold_sec": 3,
             "max_hold_sec": 300,
-            "max_spread_bps": 1.2,
+            "pnl_close_usd": 0.02,
             "engine_cycle_seconds": 25,
         }))
         assert body["restart_required"] is False
         assert body["persisted"] is True
         assert body["min_hold_sec"] == pytest.approx(3)
         assert body["max_hold_sec"] == pytest.approx(300)
-        assert body["max_spread_bps"] == pytest.approx(1.2)
+        assert body["pnl_close_usd"] == pytest.approx(0.02)
+        assert "max_spread_bps" not in body
         assert body["engine_cycle_seconds"] == pytest.approx(25)
         settings = app.state.settings
         assert app.state.engine.settings is settings
         assert app.state.engine.executor.settings is settings
-        assert settings.max_spread_bps == pytest.approx(1.2)
+        assert settings.pnl_close_usd == pytest.approx(0.02)
         assert settings.engine_cycle_seconds == pytest.approx(25)
-        # 只改价差时，持仓时钟和开仓扫描间隔保持刚才写入的值；1.1 这种小数要留下
-        body = run(update({"max_spread_bps": 1.1}))
-        assert settings.max_spread_bps == pytest.approx(1.1)
+        body = run(update({"pnl_close_usd": 0.05}))
+        assert settings.pnl_close_usd == pytest.approx(0.05)
         assert settings.min_hold_sec == pytest.approx(3)
         assert settings.max_hold_sec == pytest.approx(300)
         assert settings.engine_cycle_seconds == pytest.approx(25)
-        # 只改扫描间隔时，另外三个不变。正好 5 秒是面板下限。
+        status, detail = http_error(update({"max_spread_bps": 1.1}))
+        assert status == 400 and "没有要更新" in detail
+        assert settings.pnl_close_usd == pytest.approx(0.05)
         body = run(update({"engine_cycle_seconds": 5}))
         assert body["engine_cycle_seconds"] == pytest.approx(5)
         assert settings.engine_cycle_seconds == pytest.approx(5)
         assert settings.min_hold_sec == pytest.approx(3)
         assert settings.max_hold_sec == pytest.approx(300)
-        assert settings.max_spread_bps == pytest.approx(1.1)
+        assert settings.pnl_close_usd == pytest.approx(0.05)
         saved = env.read_text(encoding="utf-8")
         assert "UNRELATED=keep-me" in saved
-        assert "MAX_SPREAD_BPS=1.1" in saved
+        assert "MAX_SPREAD_BPS" not in saved
+        assert "PNL_CLOSE_USD=0.05" in saved
         assert "MIN_HOLD_SEC=3" in saved
         assert "MAX_HOLD_SEC=300" in saved
         assert "ENGINE_CYCLE_SECONDS=5" in saved
         listed = run(endpoint(app, "GET", "/api/tasks")())
-        assert listed["max_spread_bps"] == pytest.approx(1.1)
+        assert "max_spread_bps" not in listed
+        assert listed["pnl_close_usd"] == pytest.approx(0.05)
         assert listed["min_hold_sec"] == pytest.approx(3)
         assert listed["engine_cycle_seconds"] == pytest.approx(5)
         assert listed["cycle_seconds"] == pytest.approx(5)
         status, detail = http_error(update({"max_hold_sec": 1, "min_hold_sec": 3}))
         assert status == 400 and "不能小于" in detail
-        # 拒绝不能把已经生效的值改回去
         assert settings.max_hold_sec == pytest.approx(300)
         status, detail = http_error(update({"engine_cycle_seconds": 4}))
         assert status == 400 and "不能小于 5" in detail
@@ -158,10 +161,10 @@ def test_panel_settings_update_the_running_engine_without_a_restart():
         assert "ENGINE_CYCLE_SECONDS=5" in env.read_text(encoding="utf-8")
         status, _ = http_error(update({"engine_cycle_seconds": "abc"}))
         assert status == 400
-        status, _ = http_error(update({"max_spread_bps": "abc"}))
+        status, _ = http_error(update({"pnl_close_usd": "abc"}))
         assert status == 400
         status, _ = http_error(update({"min_hold_sec": -1}))
         assert status == 400
-        status, _ = http_error(update({"max_spread_bps": -0.1}))
+        status, _ = http_error(update({"pnl_close_usd": -0.1}))
         assert status == 400
         app.state.store.close()

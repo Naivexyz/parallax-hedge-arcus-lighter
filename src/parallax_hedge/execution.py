@@ -37,7 +37,7 @@ from .fills import (
     slippage_limit_price,
 )
 from .positions import parse_arcus_position, parse_lighter_position
-from .spread_gate import close_sides_allowed, join_price, open_sides_allowed
+from .spread_gate import join_price, open_sides_allowed
 
 # 下单后轮询仓位的节奏。Lighter 是链上交易，确认要一点时间；
 # Parallax 用的是 4 次重试，这里沿用。
@@ -723,8 +723,7 @@ class Executor:
         # 仍按它们原来的价格走；实盘开仓 / 补仓走到这里时，发单前再拒一次贵的一边。
         if quotes.get("enforce_cheap_side"):
             prices_ok, join_bps, prices_why = open_sides_allowed(
-                lighter_side, arcus_side, lighter_price, arcus_price,
-                self.settings.max_spread_bps,
+                lighter_side, arcus_side, lighter_price, arcus_price, None,
             )
             quotes["join_gap_bps"] = None if join_bps is None else round(join_bps, 4)
             if not prices_ok:
@@ -1088,23 +1087,17 @@ class Executor:
             "arcus_join": arcus_price,
             "reduce_only": reduce_only,
         }
-        # 开仓、补仓：买价必须严格低于卖价，绝对价差也不能宽于 MAX_SPREAD_BPS。
-        # 计划内平仓：买价低于卖价（价差有利）就挂，宽度不限；买价不低于卖价则不发。
+        # 开仓、补仓：买价必须严格低于卖价。价差多少 bp 不再拦截。
+        # 计划内平仓不看买卖谁贵，引擎已经按浮盈亏决定要平，这里只挂 maker。
         # 风控强制平仓走 close_pair，不进这里。
-        if action in ("open", "topup", "close"):
-            if action == "close":
-                prices_ok, join_bps, prices_why = close_sides_allowed(
-                    lighter_side, arcus_side, lighter_price, arcus_price,
-                )
-            else:
-                prices_ok, join_bps, prices_why = open_sides_allowed(
-                    lighter_side, arcus_side, lighter_price, arcus_price,
-                    self.settings.max_spread_bps,
-                )
+        if action in ("open", "topup"):
+            prices_ok, join_bps, prices_why = open_sides_allowed(
+                lighter_side, arcus_side, lighter_price, arcus_price, None,
+            )
             quotes["join_gap_bps"] = None if join_bps is None else round(join_bps, 4)
             if not prices_ok:
                 return PairResult(
-                    False, "close_wait" if action == "close" else "spread_wait",
+                    False, "spread_wait",
                     reason=prices_why, dry_run=self.dry_run,
                     quotes=quotes,
                     elapsed_ms=(time.monotonic() - started) * 1000,
@@ -1112,15 +1105,15 @@ class Executor:
                 )
         stage_ok = {"open": "dry_run", "topup": "opened", "close": "closed"}.get(action, "dry_run")
         note = (
-            f"演练：价差闸门通过，两边同时挂 maker（买跟买一、卖跟卖一），开仓不间隔。"
+            f"演练：买价低于卖价才开仓，两边同时挂 maker（买跟买一、卖跟卖一），开仓不间隔。"
             f"两腿都成交后至少持有 {min_hold:g} 秒；"
-            f"平仓买价低于卖价就立即挂 maker，宽度不限，买价不低于卖价则继续持有；"
-            f"满 {max_hold:g} 秒仍未平掉就强制平仓，不再等价差。本次未发单。"
+            f"之后两腿浮盈亏合计不低于差额就挂 maker 平，不看价差；"
+            f"满 {max_hold:g} 秒仍未平掉就强制挂 maker 平仓。本次未发单。"
         )
         if action == "close":
             quotes["close_favorable"] = True
             quotes["close_prices"] = (
-                f"价差有利，立即平仓：Lighter {lighter_side} {float(lighter_price):g} / "
+                f"挂 maker 平仓：Lighter {lighter_side} {float(lighter_price):g} / "
                 f"Arcus {arcus_side} {float(arcus_price):g}"
             )
         if self.dry_run:
@@ -1192,7 +1185,7 @@ class Executor:
         if action == "close":
             quotes["close_favorable"] = True
             quotes["close_prices"] = (
-                f"价差有利，立即平仓：Lighter {lighter_side} {float(lighter_price):g} / "
+                f"挂 maker 平仓：Lighter {lighter_side} {float(lighter_price):g} / "
                 f"Arcus {arcus_side} {float(arcus_price):g}"
             )
         t0 = time.monotonic()
@@ -1226,13 +1219,11 @@ class Executor:
         if fresh is not None:
             _ok, _why, live_l, _live_a = fresh
             if action == "close":
-                leg_ok, _bps, leg_why = close_sides_allowed(
-                    lighter_side, arcus_side, float(live_l), posted_arcus,
-                )
+                # 平仓不因为买价高于卖价撤掉。Arcus 已经挂出，Lighter 继续挂 maker。
+                leg_ok, leg_why = bool(_ok) and float(live_l) > 0, _why
             else:
                 leg_ok, _bps, leg_why = open_sides_allowed(
-                    lighter_side, arcus_side, float(live_l), posted_arcus,
-                    self.settings.max_spread_bps,
+                    lighter_side, arcus_side, float(live_l), posted_arcus, None,
                 )
             if leg_ok:
                 lighter_price = float(live_l)
@@ -1240,7 +1231,7 @@ class Executor:
                     quotes["lighter_join"] = lighter_price
                     quotes["arcus_join"] = posted_arcus
                     quotes["close_prices"] = (
-                        f"价差有利，立即平仓：Lighter {lighter_side} {float(lighter_price):g} / "
+                        f"挂 maker 平仓：Lighter {lighter_side} {float(lighter_price):g} / "
                         f"Arcus {arcus_side} {float(posted_arcus):g}"
                     )
         if not leg_ok:
@@ -1288,20 +1279,13 @@ class Executor:
             )
             if fresh is not None:
                 still_ok, still_why, live_l, live_a = fresh
-                # 已经挂出去的两个限价，对当前盘口再查。不合格就撤，
-                # 不要留着等它在坏价上成交。只有一边成交时把那条腿平掉。
-                # 平仓只在价差变成不利（买价不低于卖价）时撤；有利但宽于阈值的单留着。
+                # 开仓：挂出去的价如果变成买得不便宜，就撤。已成交的腿仍然对冲。
+                # 平仓不因为价差方向撤单，免得改去吃单。一边先成交时，收尾仍对冲那条腿。
                 posted_ok, posted_why = True, ""
-                if arcus.price and arcus.submitted:
-                    if action == "close":
-                        posted_ok, _bps, posted_why = close_sides_allowed(
-                            lighter_side, arcus_side, float(live_l), float(arcus.price),
-                        )
-                    else:
-                        posted_ok, _bps, posted_why = open_sides_allowed(
-                            lighter_side, arcus_side, float(live_l), float(arcus.price),
-                            self.settings.max_spread_bps,
-                        )
+                if action != "close" and arcus.price and arcus.submitted:
+                    posted_ok, _bps, posted_why = open_sides_allowed(
+                        lighter_side, arcus_side, float(live_l), float(arcus.price), None,
+                    )
                 if (not still_ok or not posted_ok) and not (filled_l and filled_a):
                     await self._cancel_maker_resting(market, arcus, lighter)
                     after_l, after_a = await self.read_positions(lighter_symbol, arcus_id)
@@ -1387,7 +1371,7 @@ class Executor:
     ) -> tuple[bool, str, float, float] | None:
         """重读两边盘口，算出马上要挂的价。读失败返回 None（调用方不下新单）。
 
-        closing 时只拒绝不利的平仓（买价不低于卖价）。有利的平仓不看价差阈值。
+        平仓只要算得出挂单价就过。开仓仍要求买价严格低于卖价，不看 bp 宽度。
         """
         try:
             bid, ask = await self.market.arcus_bbo(market["arcus_symbol"])
@@ -1403,14 +1387,10 @@ class Executor:
         if raw is None or lighter_px is None:
             return False, "挂单价算不出来（盘口交叉或缺档），不下单", 0.0, 0.0
         if closing:
-            ok, _bps, why = close_sides_allowed(
-                lighter_side, arcus_side, float(lighter_px), float(raw),
-            )
-        else:
-            ok, _bps, why = open_sides_allowed(
-                lighter_side, arcus_side, float(lighter_px), float(raw),
-                self.settings.max_spread_bps,
-            )
+            return True, "平仓不看价差，挂 maker", float(lighter_px), float(raw)
+        ok, _bps, why = open_sides_allowed(
+            lighter_side, arcus_side, float(lighter_px), float(raw), None,
+        )
         return ok, why, float(lighter_px), float(raw)
 
     async def _flatten_naked_maker_leg(

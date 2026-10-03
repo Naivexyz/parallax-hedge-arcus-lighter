@@ -36,7 +36,7 @@ from .risk import (
 from .ledger import ledger_rows_for_result
 from .scheduler import CycleDecision, TaskState, decide, draw_hold_hours
 from .service import FundingService
-from .spread_gate import evaluate_books, hedge_take_price, join_price, open_sides_allowed, close_sides_allowed
+from .spread_gate import evaluate_books, hedge_take_price, join_price, open_sides_allowed, unrealized_close_ready
 from .store import Store
 
 # 开仓后复核的重试节奏：Lighter 是 rollup，账户接口要几秒才反映新仓位。
@@ -311,6 +311,7 @@ class HedgeEngine:
             # 满 300 秒仍持仓就强制平，不再等价差。风控 urgent 不改。
             decision = self._hold_clock(
                 decision, task_row.get("opened_at"), now, bool(health.open_legs),
+                _net_unrealized(health),
             )
             topup_note = None
             if decision.plan == "idle" and health.open_legs:
@@ -410,17 +411,11 @@ class HedgeEngine:
                     line = ""
                     if isinstance(result.quotes, dict):
                         line = str(result.quotes.get("close_prices") or "")
-                    if line and isinstance(result.quotes, dict) and result.quotes.get("close_favorable"):
-                        # 不要写成「价差不超过 X bp」——这次是因为价差有利才平的。
-                        logged_reason = f"已平仓 — {line}"
-                        reason = line
-                        record["reason"] = line
-                    else:
-                        logged_reason = f"已平仓 — {reason}"
-                        extra = _close_price_line(result)
-                        if extra and extra not in logged_reason:
-                            logged_reason += f"；实际平仓价 {extra}"
-                            record["reason"] = f"{record['reason']}；实际平仓价 {extra}"
+                    logged_reason = f"已平仓 — {reason}"
+                    extra = _close_price_line(result)
+                    if extra and extra not in logged_reason:
+                        logged_reason += f"；{extra}"
+                        record["reason"] = f"{record['reason']}；{extra}"
                 elif result.stage == "topped_up":
                     logged_reason = f"已补仓 — {reason}"
                 if result.notes and result.quotes.get("maker"):
@@ -440,8 +435,8 @@ class HedgeEngine:
         return record
 
     def _runs_as_maker(self, decision: CycleDecision) -> bool:
-        # 演练不睡眠，留在本轮里。风控平仓和持满 300 秒的强制平仓都是 urgent，当场吃单。
-        # 找价差的 maker 平仓、以及实盘两边一起挂的开仓，放到后台。
+        # 演练不睡眠，留在本轮里。风控平仓是 urgent，当场吃单。
+        # 浮盈亏到了或持满之后的平仓都挂 maker，放到后台。
         # 没有 place_maker_pair 的替身仍在本轮里调用，避免把「先设杠杆再下单」拆开。
         if self.dry_run or decision.urgent:
             return False
@@ -612,9 +607,9 @@ class HedgeEngine:
                     ),
                     dry_run=self.dry_run, quotes=quotes, notes=["尚未下任何单"],
                 )
-            # 价差闸门：只在绝对价差不超过 MAX_SPREAD_BPS 时开仓 / 补仓。
-            # 方向改成买更便宜的卖一、卖更贵的买一，不再沿用资金费方向。
-            gate = evaluate_books(lighter_book, arcus_book, self.settings.max_spread_bps)
+            # 方向：买更便宜的卖一、卖更贵的买一。买价不低于卖价就不开。
+            # 不再用价差 bp 阈值拦开仓。
+            gate = evaluate_books(lighter_book, arcus_book)
             quotes["spread_gate"] = gate.as_dict()
             if not gate.ok:
                 return PairResult(
@@ -649,11 +644,11 @@ class HedgeEngine:
                 )
             quotes["lighter_join"] = lighter_join
             quotes["arcus_join"] = float(arcus_join)
-            # 最后一道：用即将挂出去的买价和卖价，不是卖一。
-            # 买价不低于卖价，或绝对价差宽于 MAX_SPREAD_BPS，这轮不下任何单。
+            # 最后一道：用即将挂出去的买价和卖价。买价不低于卖价就不要发。
+            # 价差有多宽不再拦截。
             prices_ok, join_bps, prices_why = open_sides_allowed(
                 lighter_side, arcus_side, lighter_join, float(arcus_join),
-                self.settings.max_spread_bps,
+                None,
             )
             quotes["join_gap_bps"] = None if join_bps is None else round(join_bps, 4)
             quotes["enforce_cheap_side"] = True
@@ -769,14 +764,15 @@ class HedgeEngine:
     # ── 辅助 ────────────────────────────────────────
     def _hold_clock(
         self, decision: CycleDecision, opened_at: float | None, now: float, holding: bool,
+        net_pnl: float | None = None,
     ) -> CycleDecision:
         """成交后的持仓时钟。开仓闸门不在这里，风控平仓也不在这里。
 
         opened_at 记的是两腿都成交、仓位记上的时刻。
-        未满 MIN_HOLD_SEC：先不平（有利的平仓也要等）。
-        已满 MIN_HOLD_SEC、未到 MAX_HOLD_SEC：平仓买价低于卖价就挂 maker，宽度不限；
-        买价不低于卖价则继续持有。
-        已满 MAX_HOLD_SEC：强制平仓，不再等价差。
+        未满 MIN_HOLD_SEC：先不平。
+        已满、未到 MAX_HOLD_SEC：两腿浮盈亏合计不低于 -浮盈亏差额就挂 maker 平。
+        更差就继续持有。已满 MAX_HOLD_SEC：强制挂 maker 平，不再看浮盈亏。
+        强制平也走 maker，不改吃单，免得 Arcus 付吃单费。
         """
         if decision.urgent or decision.plan == "flatten_orphan":
             return decision
@@ -785,12 +781,14 @@ class HedgeEngine:
         age = now - float(opened_at)
         min_hold = float(self.settings.min_hold_sec)
         max_hold = max(min_hold, float(self.settings.max_hold_sec))
+        window = max(0.0, float(self.settings.pnl_close_usd))
         if age >= max_hold:
+            net_text = "未知" if net_pnl is None else f"{net_pnl:+.4f}"
             return replace(
-                decision, plan="close", urgent=True, maker_ok=False,
+                decision, plan="close", urgent=False, maker_ok=True,
                 reason=(
                     f"两腿成交后已持有 {age:.0f} 秒，达到最长持有 {max_hold:g} 秒，"
-                    f"不再等价差，强制平仓"
+                    f"浮盈亏合计 {net_text} USDC，即使差于 -{window:g} 也强制平仓（挂 maker）"
                 ),
             )
         if age < min_hold:
@@ -810,11 +808,20 @@ class HedgeEngine:
                 )
             return decision
         if decision.plan in ("idle", "blocked", "close"):
+            if net_pnl is not None and unrealized_close_ready(net_pnl, window):
+                return replace(
+                    decision, plan="close", urgent=False, maker_ok=True,
+                    reason=(
+                        f"持有 {age:.0f} 秒，已过最短 {min_hold:g} 秒，"
+                        f"两腿浮盈亏合计 {net_pnl:+.4f} USDC，不低于 -{window:g}，挂 maker 平仓"
+                    ),
+                )
+            shown = "未知" if net_pnl is None else f"{net_pnl:+.4f}"
             return replace(
-                decision, plan="close", urgent=False, maker_ok=True,
+                decision, plan="idle", urgent=False, maker_ok=False,
                 reason=(
-                    f"持有 {age:.0f} 秒，已过最短 {min_hold:g} 秒，"
-                    f"平仓买价低于卖价就立即挂 maker，否则持有到 {max_hold:g} 秒"
+                    f"持有 {age:.0f} 秒，两腿浮盈亏合计 {shown} USDC，"
+                    f"差于 -{window:g}，未到最长持有 {max_hold:g} 秒，先不平"
                 ),
             )
         return decision
@@ -857,7 +864,7 @@ class HedgeEngine:
         self, decision, market, lighter, arcus, lighter_side, arcus_side,
         books, decimals, slippage, stop,
     ) -> PairResult:
-        """计划内平仓：买价低于卖价就挂 maker，差多少 bp 都平；否则继续持有。"""
+        """计划内平仓：引擎已经按浮盈亏决定要平。这里只挂 maker，不看价差方向。"""
         if books is None:
             return PairResult(
                 False, "close_wait", reason="拿不到两边盘口，计划内平仓先等下一轮",
@@ -879,20 +886,9 @@ class HedgeEngine:
             "lighter_join": lighter_join,
             "arcus_join": float(arcus_join),
         }
-        # 有利（买 < 卖）忽略 MAX_SPREAD_BPS。不利（买 >= 卖）不提前平。
-        prices_ok, join_bps, prices_why = close_sides_allowed(
-            lighter_side, arcus_side, lighter_join, float(arcus_join),
-        )
-        quotes["join_gap_bps"] = None if join_bps is None else round(join_bps, 4)
-        if not prices_ok:
-            return PairResult(
-                False, "close_wait", reason=prices_why, dry_run=self.dry_run,
-                quotes=quotes,
-                notes=["平仓价差不利，继续持有到最长持有，尚未下任何单"],
-            )
         quotes["close_favorable"] = True
         quotes["close_prices"] = (
-            f"价差有利，立即平仓：Lighter {lighter_side} {float(lighter_join):g} / "
+            f"挂 maker 平仓：Lighter {lighter_side} {float(lighter_join):g} / "
             f"Arcus {arcus_side} {float(arcus_join):g}"
         )
         if self.settings.arcus_maker and not self.dry_run:
@@ -927,7 +923,7 @@ class HedgeEngine:
             result.quotes["lighter_join"] = used_l
             result.quotes["arcus_join"] = used_a
             result.quotes["close_prices"] = (
-                f"价差有利，立即平仓：Lighter {lighter_side} {float(used_l):g} / "
+                f"挂 maker 平仓：Lighter {lighter_side} {float(used_l):g} / "
                 f"Arcus {arcus_side} {float(used_a):g}"
             )
             line = result.quotes["close_prices"]
@@ -1198,6 +1194,17 @@ class HedgeEngine:
         size = int(market.get("lighter_size_decimals") or market.get("quantity_decimals") or 2)
         price = int(market.get("price_decimals") or 2)
         return size, price
+
+
+
+def _net_unrealized(health) -> float | None:
+    """两边都有仓、且浮盈亏都读到了，才返回合计。缺一边就不拿 0 去凑。"""
+    legs = list(health.open_legs)
+    if len(legs) < 2:
+        return None
+    if any(leg.unrealized_pnl is None for leg in legs):
+        return None
+    return float(sum(float(leg.unrealized_pnl) for leg in legs))
 
 
 def _leg_from(data: dict[str, Any] | None, venue: str, asset: str):

@@ -1,4 +1,4 @@
-"""价差闸门：绝对值不超过 1 bp 才允许挂 maker，演练不下单。"""
+"""开仓只拒绝买得不便宜的一边。价差多宽不再拦截。平仓不看价差。"""
 import asyncio
 
 import pytest
@@ -8,7 +8,10 @@ from parallax_hedge.books import Book, Level
 from parallax_hedge.config import Settings
 from parallax_hedge.execution import Executor
 from parallax_hedge.fills import hedge_side
-from parallax_hedge.spread_gate import evaluate_books, hedge_take_price, join_price, open_sides_allowed, close_sides_allowed
+from parallax_hedge.spread_gate import (
+    evaluate_books, hedge_take_price, join_price, open_sides_allowed,
+    close_sides_allowed, unrealized_close_ready,
+)
 
 
 def _book(venue, bid, ask):
@@ -19,7 +22,7 @@ def test_a_gap_inside_one_bp_buys_the_cheaper_ask():
     # Lighter 卖一更低：买 Lighter，卖 Arcus 买一。价差约 0.24 bp。
     gate = evaluate_books(
         _book("lighter", 209.99, 210.00),
-        _book("arcus", 209.995, 210.02),
+        _book("arcus", 210.01, 210.03),
         1.0,
     )
     assert gate.ok
@@ -27,15 +30,17 @@ def test_a_gap_inside_one_bp_buys_the_cheaper_ask():
     assert gate.abs_gap_bps < 1.0
 
 
-def test_a_gap_wider_than_one_bp_does_not_open_or_schedule_a_close():
+def test_a_gap_wider_than_one_bp_still_buys_the_cheaper_ask():
+    """买价低于卖价，即使绝对价差远宽于 1 bp，也开。bp 阈值不再拦。"""
     gate = evaluate_books(
         _book("lighter", 100.00, 100.02),
         _book("arcus", 100.10, 100.12),
         1.0,
     )
-    assert not gate.ok
+    assert gate.ok
+    assert gate.direction == "long_lighter_short_arcus"
     assert gate.abs_gap_bps > 1.0
-    assert "先不开仓" in gate.reason
+    assert "先不开仓" not in gate.reason
 
 
 def test_equal_asks_have_no_direction():
@@ -84,27 +89,29 @@ LIVE_EXPENSIVE = (
 
 
 def test_the_three_live_expensive_fills_are_rejected():
+    """实盘那三笔是买贵卖便宜，仍然不能发。盘口上便宜的那个方向，宽也不拦。"""
     for name, lside, aside, lpx, apx, lb, la, ab, aa in LIVE_EXPENSIVE:
         ok, bps, reason = open_sides_allowed(lside, aside, lpx, apx, 1.0)
         assert not ok, name
-        assert bps is not None and (bps >= 0 or abs(bps) > 1.0), name
+        assert bps is not None and bps >= 0, name
         assert "不下单" in reason
         gate = evaluate_books(_book("lighter", lb, la), _book("arcus", ab, aa), 1.0)
-        assert not gate.ok, name
-        assert gate.abs_gap_bps > 1.0
+        assert gate.ok, name
+        assert gate.long_ask < gate.short_bid
 
 
-def test_eth_long_lighter_hedge_at_2662_56_is_rejected():
-    """面板写 Lighter 多 / Arcus 空，实际成交 Lighter 空 2662.56、Arcus 多 2663.43。
+def test_eth_long_lighter_hedge_wider_than_one_bp_is_still_allowed():
+    """买 2662.56、卖 2663.43，约 3.3 bp。买价更低，不再因宽度拒绝。
 
-    打算买 Lighter 时，对冲价必须是会吃到的卖一，不是 2662.56 这种买一。
-    买 2662.56、卖 2663.43，绝对价差约 3.3 bp，宽于 1 bp，不许开。
+    对冲价仍必须是会吃到的卖一，不是买一。买价不低于卖价的那一笔才拒绝。
     """
     ok, bps, reason = open_sides_allowed("buy", "sell", 2662.56, 2663.43, 1.0)
-    assert not ok
+    assert ok
     assert bps is not None and bps < 0 and abs(bps) > 1.0
     assert abs(bps) == pytest.approx(3.2666, abs=0.01)
-    assert "不下单" in reason
+    assert "不下单" not in reason
+    wrong, wrong_bps, wrong_reason = open_sides_allowed("sell", "buy", 2662.56, 2663.43, 1.0)
+    assert not wrong and wrong_bps > 0 and "不下单" in wrong_reason
     # 对冲价取卖一，排队价才是买一。两边不能混。
     book = _book("lighter", 2662.56, 2663.70)
     assert hedge_take_price(book, "buy") == 2663.70
@@ -112,8 +119,8 @@ def test_eth_long_lighter_hedge_at_2662_56_is_rejected():
 
 
 def test_a_tight_join_longs_the_cheaper_venue():
-    lighter = _book("lighter", 100.000, 100.002)
-    arcus = _book("arcus", 100.001, 100.004)
+    lighter = _book("lighter", 100.000, 100.001)
+    arcus = _book("arcus", 100.003, 100.005)
     gate = evaluate_books(lighter, arcus, 1.0)
     assert gate.ok
     assert gate.direction == "long_lighter_short_arcus"
@@ -158,20 +165,11 @@ def test_place_maker_pair_refuses_the_expensive_side_before_sending():
     assert result.quotes["join_gap_bps"] > 1
 
 
-def test_place_maker_pair_refuses_a_planned_close_when_buy_is_not_below_sell():
-    """计划内平仓用同一个价差阈值。买价等于或高于卖价时不下单。"""
-    settings = Settings(env_path=Path("."), data_dir=Path("."), dry_run=False,
-                        max_spread_bps=1.1)
-    ex = Executor(settings, market=None, dry_run=False)
-    sent = {"n": 0}
-
-    async def boom(*_a, **_k):
-        sent["n"] += 1
-        raise AssertionError("不应该发出平仓单")
-
-    ex._arcus_place = boom
-    ex._lighter_post_only = boom
-    ex.build_arcus_order = boom
+def test_place_maker_pair_close_is_not_blocked_by_price_direction():
+    """计划内平仓不看买价是否低于卖价。演练里两边都记成 maker，不吃单。"""
+    settings = Settings(env_path=Path("."), data_dir=Path("."), dry_run=True,
+                        min_hold_sec=3, max_hold_sec=300, pnl_close_usd=0.02)
+    ex = Executor(settings, market=None, dry_run=True)
 
     async def run():
         return await ex.place_maker_pair(
@@ -183,9 +181,9 @@ def test_place_maker_pair_refuses_a_planned_close_when_buy_is_not_below_sell():
         )
 
     result = asyncio.get_event_loop().run_until_complete(run())
-    assert result.ok is False and result.stage == "close_wait"
-    assert sent["n"] == 0
-    assert "不低于" in result.reason
+    assert result.ok and result.dry_run and result.stage == "closed"
+    assert result.lighter.raw["post_only"] and result.arcus.raw["timeInForce"] == "ALO"
+    assert "不低于" not in (result.reason or "")
 
 
 def test_a_favorable_close_wider_than_the_threshold_is_sent():
@@ -235,26 +233,26 @@ def test_a_favorable_close_wider_than_the_threshold_is_sent():
     result = asyncio.get_event_loop().run_until_complete(run())
     assert result.ok and result.stage == "closed"
     assert [name for name, *_ in sent] == ["arcus", "lighter"]
-    assert "价差有利" in result.quotes["close_prices"]
+    assert "挂 maker 平仓" in result.quotes["close_prices"]
     assert "100.03" in result.quotes["close_prices"] and "100" in result.quotes["close_prices"]
     ok, bps, reason = close_sides_allowed("sell", "buy", 100.03, 100.00)
     assert ok and bps < 0 and abs(bps) == pytest.approx(3.0, abs=0.02)
     assert "不超过" not in reason
 
 
-def test_an_unfavorable_close_wider_than_the_threshold_is_not_sent():
-    """平仓买价高于卖价约 3 bp：提前平仓单不发出。"""
-    settings = Settings(env_path=Path("."), data_dir=Path("."), dry_run=False, max_spread_bps=1)
-    ex = Executor(settings, market=None, dry_run=False)
-    sent = {"n": 0}
+def test_pnl_window_boundary():
+    """合计 -0.02、差额 0.02 可以平；-0.05 不行。+1 与 -1 合计 0，可以平。"""
+    assert unrealized_close_ready(0.0, 0.02)
+    assert unrealized_close_ready(-0.02, 0.02)
+    assert unrealized_close_ready(1.0 + -1.0, 0.02)
+    assert not unrealized_close_ready(-0.05, 0.02)
+    assert not unrealized_close_ready(-0.0200001, 0.02)
 
-    async def boom(*_a, **_k):
-        sent["n"] += 1
-        raise AssertionError("不应该发出平仓单")
 
-    ex._arcus_place = boom
-    ex._lighter_post_only = boom
-    ex.build_arcus_order = boom
+def test_an_unfavorable_close_is_still_a_maker_order():
+    """平仓买价高于卖价也不改吃单，演练仍记 maker。"""
+    settings = Settings(env_path=Path("."), data_dir=Path("."), dry_run=True, pnl_close_usd=0.02)
+    ex = Executor(settings, market=None, dry_run=True)
     ok, bps, _reason = close_sides_allowed("sell", "buy", 100.00, 100.03)
     assert not ok and bps > 0 and abs(bps) == pytest.approx(3.0, abs=0.02)
 
@@ -268,6 +266,5 @@ def test_an_unfavorable_close_wider_than_the_threshold_is_not_sent():
         )
 
     result = asyncio.get_event_loop().run_until_complete(run())
-    assert result.ok is False and result.stage == "close_wait"
-    assert sent["n"] == 0
-    assert "不低于" in result.reason
+    assert result.ok and result.stage == "closed" and result.dry_run
+    assert result.lighter.raw["post_only"] and result.arcus.raw["timeInForce"] == "ALO"

@@ -71,10 +71,10 @@ def test_dry_run_maker_pair_does_not_sleep_or_sign():
     assert result.ok and result.dry_run and result.stage == "dry_run"
     assert result.elapsed_ms < 500
     assert "至少持有 3" in result.notes[0] and "300" in result.notes[0]
-    assert "同时挂" in result.notes[0]
-    assert "不间隔" in result.notes[0]
+    assert "Arcus 先挂" in result.notes[0]
+    assert "吃单" in result.notes[0]
     assert called["n"] == 0
-    assert result.lighter.raw["post_only"] and result.arcus.raw["timeInForce"] == "ALO"
+    assert result.lighter.raw["timeInForce"] == "IOC" and not result.lighter.raw["post_only"] and result.arcus.raw["timeInForce"] == "ALO"
 
 
 # 2026-10-03 实盘三笔：买在更贵的一边、卖在更便宜的一边，价差都是好几 bp。
@@ -151,7 +151,7 @@ def test_place_maker_pair_refuses_the_expensive_side_before_sending():
 
     result = asyncio.get_event_loop().run_until_complete(run())
     assert result.ok and result.dry_run
-    assert result.lighter.raw["post_only"] and result.lighter.raw["price"] == 80001
+    assert result.lighter.raw["timeInForce"] == "IOC" and not result.lighter.raw["post_only"] and result.lighter.raw["price"] == 80001
     assert result.arcus.raw["timeInForce"] == "ALO" and result.arcus.raw["price"] == 80000
     assert result.lighter.raw["side"] == "buy" and result.arcus.raw["side"] == "sell"
 
@@ -173,7 +173,7 @@ def test_place_maker_pair_close_is_not_blocked_by_price_direction():
 
     result = asyncio.get_event_loop().run_until_complete(run())
     assert result.ok and result.dry_run and result.stage == "closed"
-    assert result.lighter.raw["post_only"] and result.arcus.raw["timeInForce"] == "ALO"
+    assert result.lighter.raw["timeInForce"] == "IOC" and not result.lighter.raw["post_only"] and result.arcus.raw["timeInForce"] == "ALO"
     assert "不低于" not in (result.reason or "")
 
 
@@ -209,6 +209,7 @@ def test_a_favorable_close_wider_than_the_threshold_is_sent():
     ex._fresh_maker_prices = fresh
     ex._arcus_place = place_arcus
     ex._lighter_post_only = place_lighter
+    ex._lighter_ioc = place_lighter
     ex.build_arcus_order = lambda *a, **k: {"signed": True}
 
     async def run():
@@ -258,7 +259,7 @@ def test_an_unfavorable_close_is_still_a_maker_order():
 
     result = asyncio.get_event_loop().run_until_complete(run())
     assert result.ok and result.stage == "closed" and result.dry_run
-    assert result.lighter.raw["post_only"] and result.arcus.raw["timeInForce"] == "ALO"
+    assert result.lighter.raw["timeInForce"] == "IOC" and not result.lighter.raw["post_only"] and result.arcus.raw["timeInForce"] == "ALO"
 
 
 def test_sol_second_maker_that_fails_the_window_is_not_ioc_hedged():

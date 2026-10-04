@@ -396,12 +396,12 @@ async function loadTasks() {
     const banner = $('dry-banner');
     banner.className = 'dry-banner' + (t.dry_run ? '' : ' live');
     const gateNote = ` <b>开仓</b>：不要求买在更便宜的一边。所间价差不拦开仓。`
-      + `两边一起挂 maker（0 费）。只成交一边时，未成交的留着，已成交的另挂 post-only，不吃单。`
+      + `Arcus 只做 maker，必须先成交（0 费）。成交之后立刻用 Lighter 吃单对冲（Lighter 无手续费）。Arcus 没成交就不发 Lighter，也不把 Arcus 改成吃单。`
       + `两腿都成交后至少持有 ${esc(t.min_hold_sec ?? 3)} 秒。`
-      + `之后看每一边自己的开仓价对上自己的平仓价，合计不低于 -${esc(t.pnl_close_usd ?? 0.02)} USDC 就挂 maker 平。所间价差不算亏损。`
-      + `<b>持有满 ${esc(t.max_hold_sec ?? 300)} 秒可以跟盘挂 maker，不改吃单。</b>`
+      + `之后看每一边自己的开仓价对上自己的平仓价，合计不低于 -${esc(t.pnl_close_usd ?? 0.02)} USDC 就先挂 Arcus maker，成交后 Lighter 吃单平掉。差于这个差额就先不发，Arcus 不吃单。所间价差不算亏损。`
+      + `<b>持有满 ${esc(t.max_hold_sec ?? 300)} 秒可以跟盘挂 Arcus maker，成交后 Lighter 吃单，Arcus 仍不吃单。</b>`
       + `关掉程序会撤掉挂单，并把还开着的仓位挂 maker 平掉。`
-      + `同一套规则用于全部重叠市场，包括美股永续。风控平仓仍立刻吃单。`;
+      + `同一套规则用于全部重叠市场，包括美股永续。只有风控和临近强平才让 Arcus 吃单。`;
     banner.innerHTML = t.dry_run
       ? `<b>演练模式</b> —— 引擎照常做全部判断并记录意图，但<b>不会提交任何订单</b>。`
         + (t.maker ? ` 挂单模式已开（演练里仍按吃单模拟成交）。` : '')

@@ -44,7 +44,7 @@ def test_a_standing_premium_still_posts_both_makers():
     ))
     assert result.ok and result.dry_run and result.stage == "dry_run"
     assert sent == []
-    assert result.lighter.raw["post_only"] is True
+    assert result.lighter.raw["timeInForce"] == "IOC" and result.lighter.raw["post_only"] is False
     assert result.lighter.raw["side"] == "buy" and result.lighter.raw["price"] == pytest.approx(100.0)
     assert result.arcus.raw["timeInForce"] == "ALO"
     assert result.arcus.raw["side"] == "sell" and result.arcus.raw["price"] == pytest.approx(100.17)
@@ -79,7 +79,8 @@ def test_paired_maker_close_ignores_the_cross_venue_premium():
         lighter_decimals=(2, 2), quotes=quotes, action="close", reduce_only=True,
     ))
     assert result.ok and result.stage == "closed"
-    assert result.lighter.raw["post_only"] and result.arcus.raw["timeInForce"] == "ALO"
+    assert result.lighter.raw["timeInForce"] == "IOC" and not result.lighter.raw["post_only"]
+    assert result.arcus.raw["timeInForce"] == "ALO"
     assert result.lighter.raw["price"] == pytest.approx(100.0)
     assert result.arcus.raw["price"] == pytest.approx(100.17)
     allowed, why = _close_send_allowed(quotes, 100.0, 100.17)
@@ -179,8 +180,8 @@ def test_a_book_move_cancels_resting_arcus_before_it_fills():
     assert result.ok is False and result.stage == "legs_timeout"
     assert "ioc" not in sent
     assert ("arcus", "ALO") in sent
-    assert ("lighter", "POST_ONLY") in sent
-    assert result.reason and "不低于" not in result.reason
+    assert not any(isinstance(x, tuple) and x[0] == "lighter" for x in sent)
+    assert "Lighter 未发" in (result.reason or "")
 
 
 def test_max_hold_does_not_send_a_taker_when_the_touch_fails():
@@ -216,9 +217,13 @@ def test_max_hold_does_not_send_a_taker_when_the_touch_fails():
     async def cancel(*a, **k):
         sent.append("cancel")
 
-    async def ioc(*a, **k):
-        sent.append("ioc")
-        raise AssertionError("最长持有不能改吃单")
+    async def ioc(market_id, side, quantity, price, decimals, reduce_only=False):
+        sent.append(("lighter", "IOC", side, reduce_only))
+        return LegResult("lighter", True, submitted=True, raw={"timeInForce": "IOC"})
+
+    async def arcus_ioc(*a, **k):
+        sent.append(("arcus", "IOC"))
+        raise AssertionError("Arcus 不能吃单")
 
     ex.read_positions = read_positions
     ex._fresh_maker_prices = fresh
@@ -227,10 +232,9 @@ def test_max_hold_does_not_send_a_taker_when_the_touch_fails():
     ex._arcus_cancel = cancel
     ex._lighter_cancel = cancel
     ex._lighter_ioc = ioc
-    ex._arcus_ioc = ioc
-    ex._flatten = ioc
+    ex._arcus_ioc = arcus_ioc
+    ex._flatten = arcus_ioc
     ex.build_arcus_order = lambda *a, **k: {"signed": True}
-    # 没有真实盘口时退出价退回开仓价，仍然是 maker。
     ex._touch = lambda *a, **k: _touch_async()
 
     async def _touch_async():
@@ -252,8 +256,8 @@ def test_max_hold_does_not_send_a_taker_when_the_touch_fails():
         lighter_price=100.0, arcus_price=100.0,
         lighter_decimals=(2, 2), quotes=quotes, action="close", reduce_only=True,
     ))
-    assert "ioc" not in sent
     assert ("arcus", "ALO") in sent
-    assert ("lighter", "POST_ONLY") in sent
-    assert result.quotes.get("exit_post_only") is True
-    assert "cancel" not in sent
+    assert ("lighter", "IOC", "sell", True) in sent
+    assert ("arcus", "IOC") not in sent
+    assert ("lighter", "POST_ONLY") not in sent
+    assert result.ok and result.stage == "closed"

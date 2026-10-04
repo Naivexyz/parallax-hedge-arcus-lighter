@@ -29,16 +29,17 @@ MARKET = {
 }
 
 
-def test_would_cross_reprices_one_tick_and_keeps_the_other_maker():
-    """Arcus 第一张 post-only 会吃单：挪一档再挂 ALO。Lighter 也发出去，不撤，不 IOC。"""
-    ex = Executor(_settings(), market=object(), dry_run=False)
+def test_would_cross_reprices_one_tick_and_lighter_waits_for_the_fill():
+    """Arcus 会吃单就挪一档再挂。Lighter 吃单只能出现在 Arcus 成交之后。"""
+    ex = Executor(_settings(maker_wait_seconds=2), market=object(), dry_run=False)
     sent = []
+    reads = {"n": 0}
 
     async def read_positions(symbol, market_id):
-        sent.append("read")
-        if sent.count("read") == 1:
+        reads["n"] += 1
+        if reads["n"] == 1:
             return 0.0, 0.0
-        return 0.01, -0.01
+        return 0.0, -0.01
 
     async def fresh(market, lighter_side, arcus_side, closing=False):
         return True, "挂", 80001.0, 80000.0
@@ -56,30 +57,27 @@ def test_would_cross_reprices_one_tick_and_keeps_the_other_maker():
             raw={"orderId": "a2", "timeInForce": time_in_force}, price=price,
         )
 
-    async def place_lighter(market_id, side, quantity, price, decimals, reduce_only=False):
-        sent.append(("lighter", "POST_ONLY", side, float(price), reduce_only))
-        return LegResult(
-            "lighter", True, submitted=True,
-            raw={"client_order_index": 7, "post_only": True}, price=price,
-        )
+    async def place_lighter(*_a, **_k):
+        sent.append("lighter-maker")
+        raise AssertionError("Lighter 不能挂 maker")
 
-    async def cancel(*_a, **_k):
-        sent.append("cancel")
+    async def ioc(market_id, side, quantity, price, decimals, reduce_only=False):
+        assert any(x[0] == "arcus" and x[1] == "ALO" for x in sent if isinstance(x, tuple))
+        sent.append(("lighter", "IOC", side, quantity, reduce_only))
+        return LegResult("lighter", True, submitted=True, raw={"timeInForce": "IOC"}, price=price)
 
-    async def ioc(*_a, **_k):
-        sent.append("ioc")
-        raise AssertionError("不能吃单")
+    async def arcus_ioc(*_a, **_k):
+        sent.append(("arcus", "IOC"))
+        raise AssertionError("Arcus 不能吃单")
 
     ex.read_positions = read_positions
     ex._fresh_maker_prices = fresh
     ex._touch = touch
     ex._arcus_place = place_arcus
     ex._lighter_post_only = place_lighter
-    ex._arcus_cancel = cancel
-    ex._lighter_cancel = cancel
     ex._lighter_ioc = ioc
-    ex._arcus_ioc = ioc
-    ex._flatten = ioc
+    ex._arcus_ioc = arcus_ioc
+    ex._flatten = arcus_ioc
     ex.build_arcus_order = lambda *_a, **_k: {"signed": True}
 
     result = run(ex.place_maker_pair(
@@ -90,88 +88,55 @@ def test_would_cross_reprices_one_tick_and_keeps_the_other_maker():
     ))
     arcus = [x for x in sent if isinstance(x, tuple) and x[0] == "arcus"]
     assert arcus[0] == ("arcus", "ALO", "sell", 80000.0, False)
-    assert arcus[1][1] == "ALO" and arcus[1][2] == "sell"
-    assert arcus[1][3] == pytest.approx(80001.0)
-    assert ("lighter", "POST_ONLY", "buy", 80001.0, False) in sent
-    assert "cancel" not in sent and "ioc" not in sent
+    assert arcus[1][1] == "ALO" and arcus[1][3] == pytest.approx(80001.0)
+    assert ("lighter", "IOC", "buy", pytest.approx(0.01), False) in sent
+    assert "lighter-maker" not in sent
+    assert ("arcus", "IOC") not in sent
     assert result.ok and result.stage == "opened"
+    ioc_at = next(i for i, x in enumerate(sent) if isinstance(x, tuple) and x[0] == "lighter")
+    assert ioc_at > sent.index(arcus[1])
 
 
-def test_one_filled_leg_rests_a_post_only_exit_and_leaves_the_other_maker():
-    """一边成交、另一边 3 秒还没成交：已成交的一边挂 post-only 退出，不撤未成交的对冲单。"""
-    import parallax_hedge.execution as exmod
-
-    clock = {"t": 1000.0}
-    original = exmod.time.monotonic
-    exmod.time.monotonic = lambda: clock["t"]
-    ex = Executor(_settings(maker_wait_seconds=8), market=object(), dry_run=False)
+def test_lighter_is_not_sent_when_arcus_never_rests():
+    """Arcus 没挂住：Lighter 一张都不发，也不能先有 Lighter 成交。"""
+    ex = Executor(_settings(maker_wait_seconds=2), market=object(), dry_run=False)
     sent = []
-    reads = {"n": 0}
 
     async def read_positions(symbol, market_id):
-        reads["n"] += 1
-        if reads["n"] == 1:
-            return 0.0, 0.0
-        return 0.01, 0.0
+        return 0.0, 0.0
 
     async def fresh(market, lighter_side, arcus_side, closing=False):
         return True, "挂", 80001.0, 80000.0
 
-    async def touch(market, venue, side):
-        return 79999.0, 80001.0, 79999.0 if side == "buy" else 80001.0
-
     async def place_arcus(market, side, quantity, price, reduce_only=False, time_in_force="IOC"):
-        sent.append(("arcus", time_in_force, side, reduce_only))
-        return LegResult("arcus", True, submitted=True, raw={"orderId": "a1"}, price=price)
+        sent.append(("arcus", time_in_force))
+        return LegResult("arcus", False, submitted=False, error="Arcus 拒单")
 
-    async def place_lighter(market_id, side, quantity, price, decimals, reduce_only=False):
-        sent.append(("lighter", "POST_ONLY", side, quantity, reduce_only))
-        return LegResult(
-            "lighter", True, submitted=True,
-            raw={"client_order_index": 3, "post_only": True}, price=price,
-        )
-
-    async def cancel(*_a, **_k):
-        sent.append("cancel")
+    async def place_lighter(*_a, **_k):
+        sent.append("lighter")
+        raise AssertionError("不该发 Lighter")
 
     async def ioc(*_a, **_k):
         sent.append("ioc")
-        raise AssertionError("不能吃单")
-
-    async def sleep_gap(seconds, stop=None):
-        clock["t"] += seconds
-        return True
+        raise AssertionError("不该吃 Lighter")
 
     ex.read_positions = read_positions
     ex._fresh_maker_prices = fresh
-    ex._touch = touch
     ex._arcus_place = place_arcus
     ex._lighter_post_only = place_lighter
-    ex._arcus_cancel = cancel
-    ex._lighter_cancel = cancel
     ex._lighter_ioc = ioc
     ex._arcus_ioc = ioc
-    ex._flatten = ioc
-    ex._sleep_gap = sleep_gap
     ex.build_arcus_order = lambda *_a, **_k: {"signed": True}
 
-    try:
-        result = run(ex.place_maker_pair(
-            market=MARKET, lighter_side="buy", arcus_side="sell",
-            lighter_quantity=0.01, arcus_quantity=0.01,
-            lighter_price=80001, arcus_price=80000,
-            lighter_decimals=(5, 1), quotes={}, action="open", quantity=0.01,
-        ))
-    finally:
-        exmod.time.monotonic = original
-    assert ("arcus", "ALO", "sell", False) in sent
-    exits = [x for x in sent if isinstance(x, tuple) and x[0] == "lighter" and x[4] is True]
-    assert exits and exits[0][1] == "POST_ONLY" and exits[0][2] == "sell"
-    assert "cancel" not in sent and "ioc" not in sent
-    assert result.stage == "maker_exit"
-    assert result.quotes.get("maker_exit") and result.quotes.get("exit_post_only")
-    blob = (result.reason or "") + " ".join(result.notes or [])
-    assert "抢救失败" not in blob
+    result = run(ex.place_maker_pair(
+        market=MARKET, lighter_side="buy", arcus_side="sell",
+        lighter_quantity=0.01, arcus_quantity=0.01,
+        lighter_price=80001, arcus_price=80000,
+        lighter_decimals=(5, 1), quotes={}, action="open", quantity=0.01,
+    ))
+    assert result.ok is False and result.stage == "arcus_not_resting"
+    assert sent == [("arcus", "ALO")]
+    assert "Lighter 未发" in (result.reason or "")
 
 
 def test_cancel_resting_on_shutdown_does_not_take():

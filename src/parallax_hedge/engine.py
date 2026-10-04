@@ -36,7 +36,7 @@ from .risk import (
 from .ledger import ledger_rows_for_result
 from .scheduler import CycleDecision, TaskState, decide, draw_hold_hours
 from .service import FundingService
-from .spread_gate import evaluate_books, hedge_take_price, join_price, open_sides_allowed, round_trip_close_net, unrealized_close_ready
+from .spread_gate import evaluate_books, join_price, open_join_round_trip_allowed, open_sides_allowed, round_trip_close_net, unrealized_close_ready
 from .store import Store
 
 # 开仓后复核的重试节奏：Lighter 是 rollup，账户接口要几秒才反映新仓位。
@@ -496,10 +496,16 @@ class HedgeEngine:
             price = 0.0
 
         if decision.plan == "flatten_orphan":
+            venue = decision.orphan_venue or "lighter"
+            entry = None
+            if venue == "lighter" and health.lighter is not None:
+                entry = health.lighter.entry_price
+            elif venue == "arcus" and health.arcus is not None:
+                entry = health.arcus.entry_price
             leg = await self.executor.flatten_orphan(
-                market=market, venue=decision.orphan_venue or "lighter",
+                market=market, venue=venue,
                 size=decision.orphan_size, price=price, slippage_bps=slippage,
-                lighter_decimals=decimals,
+                lighter_decimals=decimals, entry_price=entry,
             )
             return PairResult(
                 leg.ok, "flatten_orphan", reason=decision.reason, dry_run=self.dry_run,
@@ -634,12 +640,8 @@ class HedgeEngine:
             arcus_join = passive_price(
                 market, arcus_side, arcus_book.best_bid or 0, arcus_book.best_ask or 0,
             )
-            # Arcus 挂单、Lighter 立刻 IOC 对冲时，Lighter 吃的是对手价，不是排队价。
-            # 买单的买一是卖出才会碰到的价格，用它过闸会把贵的一边放出去。
-            if self.settings.arcus_maker and not self.dry_run:
-                lighter_join = hedge_take_price(lighter_book, lighter_side)
-            else:
-                lighter_join = join_price(lighter_book, lighter_side)
+            # 两边都挂 maker：买跟买一，卖跟卖一。不再用 Lighter 的吃单价过闸。
+            lighter_join = join_price(lighter_book, lighter_side)
             if arcus_join is None or lighter_join is None:
                 return PairResult(
                     False, "spread_wait", reason="挂单价算不出来（盘口交叉或缺档），本轮不下单",
@@ -659,6 +661,18 @@ class HedgeEngine:
                 return PairResult(
                     False, "spread_wait", reason=prices_why, dry_run=self.dry_run,
                     quotes=quotes, notes=["挂单价没有通过最后一道检查，尚未下任何单"],
+                )
+            window = max(0.0, float(self.settings.pnl_close_usd))
+            trip_ok, trip_net, trip_why = open_join_round_trip_allowed(
+                lighter_side, arcus_side, float(lighter_join), float(arcus_join),
+                float(decision.quantity), window,
+            )
+            quotes["pnl_close_usd"] = window
+            quotes["estimated_open_net"] = None if trip_net is None else round(float(trip_net), 6)
+            if not trip_ok:
+                return PairResult(
+                    False, "spread_wait", reason=trip_why, dry_run=self.dry_run,
+                    quotes=quotes, notes=["锁住的往返已经差于浮盈亏差额，尚未下任何单"],
                 )
             if topup:
                 # 补仓也要过同一个价差闸门，两边都挂 maker
@@ -774,8 +788,8 @@ class HedgeEngine:
         opened_at 记的是两腿都成交、仓位记上的时刻。
         未满 MIN_HOLD_SEC：先不平。
         已满、未到 MAX_HOLD_SEC：两腿浮盈亏合计不低于 -浮盈亏差额就挂 maker 平。
-        更差就继续持有。已满 MAX_HOLD_SEC：强制挂 maker 平，不再看浮盈亏。
-        强制平也走 maker，不改吃单，免得 Arcus 付吃单费。
+        更差就继续持有。已满 MAX_HOLD_SEC：跟盘挂 maker 平。
+        跟盘价亏过差额时也只继续挂 maker，不因为到点改吃单。
         """
         if decision.urgent or decision.plan == "flatten_orphan":
             return decision
@@ -791,7 +805,7 @@ class HedgeEngine:
                 decision, plan="close", urgent=False, maker_ok=True, force_close=True,
                 reason=(
                     f"两腿成交后已持有 {age:.0f} 秒，达到最长持有 {max_hold:g} 秒，"
-                    f"浮盈亏合计 {net_text} USDC，即使差于 -{window:g} 也强制平仓（挂 maker）"
+                    f"浮盈亏合计 {net_text} USDC，即使差于 -{window:g} 也强制平仓（跟盘挂 maker，不改吃单）"
                 ),
             )
         if age < min_hold:
@@ -838,7 +852,10 @@ class HedgeEngine:
         ARCUS_MAKER 仍走原来的「Arcus 挂单、Lighter 立刻对冲」，但只有闸门通过才进得去。
         测试替身如果没有 place_maker_pair，就退回它已有的 open_pair。
         """
-        if self.settings.arcus_maker and not self.dry_run:
+        # 实盘两边都挂 maker。有 place_maker_pair 就走它，不再让一边成交去 IOC 另一边。
+        # 没有这个方法的测试替身才退回旧的挂单器或 open_pair。
+        fn = getattr(self.executor, "place_maker_pair", None)
+        if fn is None and self.settings.arcus_maker and not self.dry_run:
             return await self._maker(stop).open_pair(
                 market=market, direction=decision.direction or "",
                 quantity=decision.quantity,
@@ -846,7 +863,6 @@ class HedgeEngine:
                 slippage_bps=self.settings.order_slippage_bps,
                 lighter_decimals=decimals, quotes=quotes, action=action,
             )
-        fn = getattr(self.executor, "place_maker_pair", None)
         if fn is None:
             return await self.executor.open_pair(
                 market=market, direction=decision.direction or "",

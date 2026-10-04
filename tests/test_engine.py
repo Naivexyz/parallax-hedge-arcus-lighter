@@ -54,13 +54,13 @@ class FakeClient:
         # Lighter 卖一低于 Arcus 买一：买 Lighter、卖 Arcus，买价严格更便宜。
         # 不再靠「绝对价差小于 1 bp」把买贵卖便宜放过去。
         return Book(venue="lighter", symbol=symbol,
-                    bids=[Level(mark * 1.00000, 50)], asks=[Level(mark * 1.00001, 50)])
+                    bids=[Level(mark, 50)], asks=[Level(mark * 1.000001, 50)])
 
     async def arcus_book(self, symbol):
         from parallax_hedge.books import Book, Level
         mark = self.row.get("mark_price") or 210.0
         return Book(venue="arcus", symbol=symbol,
-                    bids=[Level(mark * 1.00003, 50)], asks=[Level(mark * 1.00006, 50)])
+                    bids=[Level(mark * 1.000002, 50)], asks=[Level(mark * 1.000003, 50)])
     async def lighter_account(self):
         return {"accounts": [{"account_index": 77, "available_balance": "300"}]}
     async def arcus_account(self):
@@ -77,7 +77,10 @@ class FakeService:
 
 def make(tmp, r, **over):
     kw = dict(env_path=Path("."), data_dir=Path(tmp), lighter_account_index=77,
-              min_corridor_pct=4.0, reopen_cooldown_seconds=60.0, dry_run=True)
+              min_corridor_pct=4.0, reopen_cooldown_seconds=60.0, dry_run=True,
+              # 夹具盘口对齐到 0.01 tick 后，全仓数量的往返大约 0.08 USDC。
+              # 面板差额放到 0.10，这些旧用例仍然开得成。产品默认仍是 0.02。
+              pnl_close_usd=0.10)
     kw.update(over)
     st = Settings(**kw)
     service = FakeService(r)
@@ -1262,7 +1265,11 @@ def test_a_healthy_top_up_is_left_running():
 
 
 def test_the_three_live_books_open_the_cheaper_side_even_when_wide():
-    """那三笔盘口价差都宽于 1 bp，但买便宜的一边仍然开。反方向的成交价由闸门拒绝。"""
+    """方向仍是买更便宜的一边。但挂单价锁住的往返（USDC）差于面板差额时不发单。
+
+    这三笔价差换成全仓数量都远超默认 0.02 USDC，v1.5 不开。
+    把面板差额放到够大，同一盘口又会开。差额不是写死的 0.02。
+    """
     books = (
         (2652.90, 2652.97, 2654.44, 2654.51),
         (117.6700, 117.6800, 117.7580, 117.7700),
@@ -1271,6 +1278,7 @@ def test_the_three_live_books_open_the_cheaper_side_even_when_wide():
     for lb, la, ab, aa in books:
         with tempfile.TemporaryDirectory() as tmp:
             eng, store, _ = make(tmp, row())
+            eng.settings.pnl_close_usd = 0.02
 
             async def lighter_book(market_id, symbol, limit=100, _lb=lb, _la=la):
                 from parallax_hedge.books import Book, Level
@@ -1286,9 +1294,18 @@ def test_the_three_live_books_open_the_cheaper_side_even_when_wide():
             eng.service.client.arcus_book = arcus_book
             store.upsert_task("OAI", enabled=1, leverage=6.0, rotation_hours=4.0)
             d = run(eng.run_cycle())
-            assert d[0]["plan"] == "open", d[0]
+            assert d[0]["result"]["stage"] == "spread_wait", d[0]
             task = store.get_task("OAI")
-            assert task["opened_at"] is not None
+            assert task["opened_at"] is None
+            logged = store.recent_cycles()[0]
+            assert logged["plan"] == "spread_wait"
+            assert "0.02" in logged["reason"]
+            # 同一盘口，面板差额放宽后可以开，方向仍是便宜的一边。
+            eng.settings.pnl_close_usd = 50
+            store.upsert_task("OAI", enabled=1, leverage=6.0, rotation_hours=4.0)
+            d2 = run(eng.run_cycle())
+            assert d2[0]["plan"] == "open", d2[0]
+            task = store.get_task("OAI")
             cheap = "long_lighter_short_arcus" if la < aa else "short_lighter_long_arcus"
             assert task["open_direction"] == cheap
 

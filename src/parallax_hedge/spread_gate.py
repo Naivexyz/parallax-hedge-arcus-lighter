@@ -1,7 +1,9 @@
 """Arcus 与 Lighter 的开仓方向闸门，以及平仓用的浮盈亏差额。
 
 开仓、补仓：买更便宜的一边，卖更贵的一边。买价必须严格低于卖价。
-不再用绝对价差多少 bp 决定开不开。宽，但买得更便宜，仍然开。
+不再用绝对价差多少 bp 决定开不开。但两边 maker 挂单价锁住的往返
+（平仓要还回去的价差，USDC）已经差于面板「浮盈亏差额」时，两边都不发。
+差额就是面板那一个数，开和平用同一个。
 
 计划内平仓不看价差，也不看 bp。两腿都成交并过了最短持有之后，
 发单前用两边即将挂出的价格重算往返盈亏，不能只看标记浮盈亏。
@@ -167,6 +169,136 @@ def open_sides_allowed(
     if prices is None:
         return False, None, "两条腿不是一买一卖，不下单"
     return order_prices_allowed(prices[0], prices[1], max_bps)
+
+
+def locked_open_net(buy_price: float, sell_price: float, quantity: float) -> float | None:
+    """开仓两边 maker 挂单价锁住的往返，单位 USDC。
+
+    买在更便宜的一边、卖在更贵的一边，当下看起来是赚的。
+    平仓要把这个价差还回去，所以预期净盈亏 = (买价 - 卖价) × 数量，是负数。
+    数量取绝对值。价格或数量无效时返回 None。
+    """
+    try:
+        buy = float(buy_price)
+        sell = float(sell_price)
+        qty = abs(float(quantity))
+    except (TypeError, ValueError):
+        return None
+    if buy != buy or sell != sell or qty != qty:
+        return None
+    if buy <= 0 or sell <= 0 or qty <= 0:
+        return None
+    if buy in (float("inf"), float("-inf")) or sell in (float("inf"), float("-inf")):
+        return None
+    return (buy - sell) * qty
+
+
+def open_round_trip_allowed(
+    buy_price: float, sell_price: float, quantity: float, tolerance_usd: float,
+) -> tuple[bool, float | None, str]:
+    """开仓前：锁住的往返已经差于面板「浮盈亏差额」就不发单。
+
+    tolerance_usd 就是面板上的浮盈亏差额，不是另一道阈值。
+    用户改成 0.05 或 0.01，这里跟着变。净盈亏不低于 -差额才开。
+    """
+    net = locked_open_net(buy_price, sell_price, quantity)
+    if net is None:
+        return False, None, "开仓往返估算不出来，不下单"
+    try:
+        window = float(tolerance_usd)
+    except (TypeError, ValueError):
+        return False, net, "浮盈亏差额无效，不下单"
+    if window != window or window in (float("inf"), float("-inf")):
+        return False, net, "浮盈亏差额无效，不下单"
+    if window < 0:
+        window = 0.0
+    if not unrealized_close_ready(net, window):
+        return False, net, (
+            f"按两边挂单价估算往返 {net:+.4f} USDC，"
+            f"已经差于 -{window:g}，这个价差平仓时要还回去，两边都不下"
+        )
+    return True, net, (
+        f"按两边挂单价估算往返 {net:+.4f} USDC，没有差于 -{window:g}"
+    )
+
+
+def open_join_round_trip_allowed(
+    lighter_side: str, arcus_side: str, lighter_price: float, arcus_price: float,
+    quantity: float, tolerance_usd: float,
+) -> tuple[bool, float | None, str]:
+    """用两条腿的 maker 挂单价估算开仓往返。"""
+    prices = buy_sell_prices(lighter_side, arcus_side, lighter_price, arcus_price)
+    if prices is None:
+        return False, None, "两条腿不是一买一卖，不下单"
+    return open_round_trip_allowed(prices[0], prices[1], quantity, tolerance_usd)
+
+
+def maker_exit_price(
+    side: str, entry: float, quantity: float, join: float,
+    best_bid: float | None, best_ask: float | None, tolerance_usd: float,
+) -> float | None:
+    """单腿退出的 maker 价。能跟盘口就跟；跟了会亏过差额就往回挂，绝不穿过对手价。
+
+    卖单不能打到买一，买单不能打到卖一。join 在差额以内就用 join。
+    否则挂在「刚好亏到差额」的那一档；那一档会吃单时，就停在不吃单的一侧。
+    """
+    try:
+        entry_f = float(entry)
+        qty = abs(float(quantity))
+        join_f = float(join)
+        window = float(tolerance_usd)
+    except (TypeError, ValueError):
+        return None
+    if entry_f != entry_f or qty != qty or join_f != join_f or window != window:
+        return None
+    if qty <= 0 or entry_f <= 0 or join_f <= 0:
+        return None
+    if window < 0 or window in (float("inf"), float("-inf")):
+        window = 0.0
+    bid = None
+    ask = None
+    try:
+        if best_bid is not None and float(best_bid) > 0:
+            bid = float(best_bid)
+        if best_ask is not None and float(best_ask) > 0:
+            ask = float(best_ask)
+    except (TypeError, ValueError):
+        return None
+
+    def pnl(px: float) -> float:
+        if side == "sell":
+            return (px - entry_f) * qty
+        return (entry_f - px) * qty
+
+    def crosses(px: float) -> bool:
+        if side == "sell":
+            return bid is not None and px <= bid
+        return ask is not None and px >= ask
+
+    if unrealized_close_ready(pnl(join_f), window) and not crosses(join_f):
+        return join_f
+    if side == "sell":
+        limit = entry_f - (window / qty)
+    else:
+        limit = entry_f + (window / qty)
+    if limit <= 0 or limit != limit or limit in (float("inf"), float("-inf")):
+        return None
+    if not crosses(limit):
+        return limit
+    # 差额允许的价已经穿到对手价里面：停在不吃单的那一侧，不追。
+    nudge = max((bid or ask or join_f) * 1e-8, 1e-8)
+    if side == "sell":
+        if ask is not None and not crosses(ask) and unrealized_close_ready(pnl(ask), window):
+            return ask
+        if bid is not None:
+            return bid + nudge
+        return None
+    if bid is not None and not crosses(bid) and unrealized_close_ready(pnl(bid), window):
+        return bid
+    if ask is not None:
+        backed = ask - nudge
+        return backed if backed > 0 else None
+    return None
 
 
 def unrealized_close_ready(net_pnl: float, window_usd: float) -> bool:

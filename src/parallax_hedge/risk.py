@@ -354,7 +354,7 @@ def evaluate(
         return RiskVerdict(
             "flatten_orphan",
             f"只剩 {leg.venue} 一条腿（{leg.side} {abs(leg.size):g}），"
-            f"另一条已不在 —— 当前是满仓单边裸露，立刻市价平掉",
+            f"另一条已不在 —— 当前是满仓单边裸露，立刻挂 maker 平掉，不吃单",
             urgent=True,
         )
 

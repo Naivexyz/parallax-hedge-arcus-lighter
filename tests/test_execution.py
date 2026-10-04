@@ -85,6 +85,15 @@ class ScriptedExecutor(Executor):
                          raw={"response": "code=200 tx_hash=abc"},
                          error=None if self.lighter_ok else "拒单")
 
+    async def _post_reduce_maker(self, market, venue, quantity, side, entry, lighter_decimals):
+        """v1.5 孤腿 / 单腿退出：只记录 maker，不走 IOC。"""
+        if venue == "arcus":
+            assert market["arcus_market_id"] == 26
+            self.arcus_orders.append((side, quantity, True, "ALO"))
+            return LegResult("arcus", True, raw={"orderId": "alo1", "timeInForce": "ALO"})
+        self.lighter_orders.append((side, quantity, True, "POST_ONLY"))
+        return LegResult("lighter", True, raw={"client_order_index": 1, "post_only": True})
+
     async def _arcus_ioc(self, market, side, quantity, price, reduce_only=False):
         # 第一个参数必须是整个市场字典 —— Arcus 下单要 marketId、tick 分段、步长
         assert market["arcus_market_id"] == 26
@@ -532,7 +541,8 @@ def test_close_and_orphan_paths_pass_the_whole_market():
     ex3 = ScriptedExecutor(settings(), FakeMarket(arcus=-0.2))
     run(ex3.flatten_orphan(market=MARKET, venue="arcus", size=-0.2,
                            price=1000.0, slippage_bps=10.0, lighter_decimals=(2, 2)))
-    assert ex3.arcus_orders == [("buy", 0.2, True)]
+    assert ex3.arcus_orders == [("buy", 0.2, True, "ALO")]
+    assert all(row[3] != "IOC" for row in ex3.arcus_orders)
 
 
 # ═══════════════════════════════════════════════════════════

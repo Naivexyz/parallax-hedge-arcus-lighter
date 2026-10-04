@@ -395,12 +395,12 @@ async function loadTasks() {
     renderUnmanaged(t.unmanaged);
     const banner = $('dry-banner');
     banner.className = 'dry-banner' + (t.dry_run ? '' : ' live');
-    const gateNote = ` <b>开仓</b>：买更便宜的一边、卖更贵的一边。买价必须严格低于卖价，不再用价差 bp 阈值。`
-      + `Arcus 先挂 maker（0 费），Lighter 对冲（吃单或挂单都是 0 费）。方向反了的单不会发出。`
+    const gateNote = ` <b>开仓</b>：买更便宜的一边、卖更贵的一边。买价必须严格低于卖价。所间价差不拦开仓。`
+      + `Arcus 先挂 maker（0 费），Lighter 也挂 maker。一边成交不去吃另一边。`
       + `两腿都成交后至少持有 ${esc(t.min_hold_sec ?? 3)} 秒。`
-      + `之后两边浮盈亏合计不低于 -${esc(t.pnl_close_usd ?? 0.02)} USDC 就挂 maker 平（合计 0，或正好差这么多，都平；更差就等）。`
-      + `<b>持有满 ${esc(t.max_hold_sec ?? 300)} 秒仍未平掉就强制挂 maker 平，不再看浮盈亏。</b>`
-      + `平仓不改吃单，免得 Arcus 付吃单费。已经成交的一条腿仍然会对冲。`
+      + `之后看每一边自己的开仓价对上自己的平仓价，合计不低于 -${esc(t.pnl_close_usd ?? 0.02)} USDC 就挂 maker 平。所间价差不算亏损。`
+      + `<b>持有满 ${esc(t.max_hold_sec ?? 300)} 秒可以跟盘挂 maker，不改吃单。</b>`
+      + `只成交一边就挂 maker 退出。`
       + `同一套规则用于全部重叠市场，包括美股永续。风控平仓仍立刻吃单。`;
     banner.innerHTML = t.dry_run
       ? `<b>演练模式</b> —— 引擎照常做全部判断并记录意图，但<b>不会提交任何订单</b>。`

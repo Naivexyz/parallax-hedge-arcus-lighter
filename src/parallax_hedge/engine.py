@@ -36,7 +36,7 @@ from .risk import (
 from .ledger import ledger_rows_for_result
 from .scheduler import CycleDecision, TaskState, decide, draw_hold_hours
 from .service import FundingService
-from .spread_gate import evaluate_books, join_price, open_join_round_trip_allowed, open_sides_allowed, round_trip_close_net, unrealized_close_ready
+from .spread_gate import evaluate_books, join_price, open_sides_allowed, round_trip_close_net, unrealized_close_ready
 from .store import Store
 
 # 开仓后复核的重试节奏：Lighter 是 rollup，账户接口要几秒才反映新仓位。
@@ -662,18 +662,7 @@ class HedgeEngine:
                     False, "spread_wait", reason=prices_why, dry_run=self.dry_run,
                     quotes=quotes, notes=["挂单价没有通过最后一道检查，尚未下任何单"],
                 )
-            window = max(0.0, float(self.settings.pnl_close_usd))
-            trip_ok, trip_net, trip_why = open_join_round_trip_allowed(
-                lighter_side, arcus_side, float(lighter_join), float(arcus_join),
-                float(decision.quantity), window,
-            )
-            quotes["pnl_close_usd"] = window
-            quotes["estimated_open_net"] = None if trip_net is None else round(float(trip_net), 6)
-            if not trip_ok:
-                return PairResult(
-                    False, "spread_wait", reason=trip_why, dry_run=self.dry_run,
-                    quotes=quotes, notes=["锁住的往返已经差于浮盈亏差额，尚未下任何单"],
-                )
+            # 所间价差不是锁住的亏损。两边都挂 maker 时，开仓不拿浮盈亏差额拦。
             if topup:
                 # 补仓也要过同一个价差闸门，两边都挂 maker
                 result = await self._place_gated(
@@ -926,8 +915,8 @@ class HedgeEngine:
             return PairResult(
                 False, "close_wait",
                 reason=(
-                    f"标记浮盈亏不足以放行：按即将发出的平仓价估算往返 {shown} USDC，"
-                    f"差于 -{window:g}，未到最长持有，先不平"
+                    f"按各边自己的开仓价对上即将发出的平仓价，合计 {shown} USDC，"
+                    f"差于 -{window:g}。所间价差不算这笔亏损。未到最长持有，先不平"
                 ),
                 dry_run=self.dry_run, quotes=quotes,
                 notes=["尚未下任何单"],

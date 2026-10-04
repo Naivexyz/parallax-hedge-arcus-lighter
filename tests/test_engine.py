@@ -77,10 +77,7 @@ class FakeService:
 
 def make(tmp, r, **over):
     kw = dict(env_path=Path("."), data_dir=Path(tmp), lighter_account_index=77,
-              min_corridor_pct=4.0, reopen_cooldown_seconds=60.0, dry_run=True,
-              # 夹具盘口对齐到 0.01 tick 后，全仓数量的往返大约 0.08 USDC。
-              # 面板差额放到 0.10，这些旧用例仍然开得成。产品默认仍是 0.02。
-              pnl_close_usd=0.10)
+              min_corridor_pct=4.0, reopen_cooldown_seconds=60.0, dry_run=True)
     kw.update(over)
     st = Settings(**kw)
     service = FakeService(r)
@@ -1265,10 +1262,9 @@ def test_a_healthy_top_up_is_left_running():
 
 
 def test_the_three_live_books_open_the_cheaper_side_even_when_wide():
-    """方向仍是买更便宜的一边。但挂单价锁住的往返（USDC）差于面板差额时不发单。
+    """所间价差十几 bp 也要开。两边一起挂 maker，这个价差不是锁住的亏损。
 
-    这三笔价差换成全仓数量都远超默认 0.02 USDC，v1.5 不开。
-    把面板差额放到够大，同一盘口又会开。差额不是写死的 0.02。
+    方向仍是买更便宜的一边。面板差额保持 0.02，不因为价差宽就改成不开。
     """
     books = (
         (2652.90, 2652.97, 2654.44, 2654.51),
@@ -1294,20 +1290,14 @@ def test_the_three_live_books_open_the_cheaper_side_even_when_wide():
             eng.service.client.arcus_book = arcus_book
             store.upsert_task("OAI", enabled=1, leverage=6.0, rotation_hours=4.0)
             d = run(eng.run_cycle())
-            assert d[0]["result"]["stage"] == "spread_wait", d[0]
+            assert d[0]["plan"] == "open", d[0]
             task = store.get_task("OAI")
-            assert task["opened_at"] is None
-            logged = store.recent_cycles()[0]
-            assert logged["plan"] == "spread_wait"
-            assert "0.02" in logged["reason"]
-            # 同一盘口，面板差额放宽后可以开，方向仍是便宜的一边。
-            eng.settings.pnl_close_usd = 50
-            store.upsert_task("OAI", enabled=1, leverage=6.0, rotation_hours=4.0)
-            d2 = run(eng.run_cycle())
-            assert d2[0]["plan"] == "open", d2[0]
-            task = store.get_task("OAI")
+            assert task["opened_at"] is not None
             cheap = "long_lighter_short_arcus" if la < aa else "short_lighter_long_arcus"
             assert task["open_direction"] == cheap
+            logged = store.recent_cycles()[0]
+            assert logged["plan"] == "open"
+            assert "还回去" not in (logged["reason"] or "")
 
 
 def _override_books(eng, lighter_bid, lighter_ask, arcus_bid, arcus_ask):

@@ -38,7 +38,7 @@ from .fills import (
 )
 from .positions import parse_arcus_position, parse_lighter_position
 from .spread_gate import (
-    join_price, maker_exit_price, open_join_round_trip_allowed, open_sides_allowed,
+    join_price, maker_exit_price, open_sides_allowed,
     round_trip_close_net, unrealized_close_ready,
 )
 
@@ -201,10 +201,10 @@ class PairResult:
 
 
 def _close_send_allowed(quotes: dict[str, Any], lighter_px: float, arcus_px: float) -> tuple[bool, str]:
-    """计划内平仓：用即将发出（或已经挂着）的两个价格估算往返。
+    """计划内平仓：每一边自己的开仓价对上自己即将发出的平仓价，再加总。
 
-    没有开仓价时不在这里拦（引擎已经拦过，旧测试也不带开仓价）。
-    最长持有强制平仓不拦。估算差于浮盈亏差额就返回 False，调用方撤未成交的 maker，不改吃单。
+    两所之间的价差不算亏损。没有开仓价时不在这里拦（引擎已经拦过，旧测试也不带开仓价）。
+    最长持有强制平仓不拦。合计差于面板浮盈亏差额就返回 False，调用方撤未成交的 maker，不改吃单。
     """
     if quotes.get("force_close"):
         # 到点可以不再等价，挂 maker 跟盘。仍然不能改吃单。
@@ -1127,16 +1127,7 @@ class Executor:
                 lighter_side, arcus_side, lighter_price, arcus_price, None,
             )
             quotes["join_gap_bps"] = None if join_bps is None else round(join_bps, 4)
-            if prices_ok:
-                qty = float(quantity if quantity is not None else lighter_quantity)
-                window = float(self.settings.pnl_close_usd)
-                trip_ok, trip_net, trip_why = open_join_round_trip_allowed(
-                    lighter_side, arcus_side, lighter_price, arcus_price, qty, window,
-                )
-                quotes["pnl_close_usd"] = window
-                quotes["estimated_open_net"] = None if trip_net is None else round(trip_net, 6)
-                if not trip_ok:
-                    prices_ok, prices_why = False, trip_why
+            # 所间价差不拦开仓。买价必须严格低于卖价，宽多少都可以挂。
             if not prices_ok:
                 return PairResult(
                     False, "spread_wait",
@@ -1217,17 +1208,6 @@ class Executor:
         quotes["arcus_join"] = arcus_price
         quotes["maker_rule"]["lighter_join"] = lighter_price
         quotes["maker_rule"]["arcus_join"] = arcus_price
-        if prices_ok and action in ("open", "topup"):
-            qty = float(quantity if quantity is not None else lighter_quantity)
-            window = float(self.settings.pnl_close_usd)
-            trip_ok, trip_net, trip_why = open_join_round_trip_allowed(
-                lighter_side, arcus_side, float(lighter_price), float(arcus_price),
-                qty, window,
-            )
-            quotes["pnl_close_usd"] = window
-            quotes["estimated_open_net"] = None if trip_net is None else round(float(trip_net), 6)
-            if not trip_ok:
-                prices_ok, prices_why = False, trip_why
         if not prices_ok:
             return PairResult(
                 False, "close_wait" if action == "close" else "spread_wait",
@@ -1292,14 +1272,6 @@ class Executor:
                 leg_ok, _bps, leg_why = open_sides_allowed(
                     lighter_side, arcus_side, float(live_l), posted_arcus, None,
                 )
-                if leg_ok:
-                    qty = float(quantity if quantity is not None else lighter_quantity)
-                    trip_ok, _net, trip_why = open_join_round_trip_allowed(
-                        lighter_side, arcus_side, float(live_l), float(posted_arcus),
-                        qty, float(self.settings.pnl_close_usd),
-                    )
-                    if not trip_ok:
-                        leg_ok, leg_why = False, trip_why
             if leg_ok:
                 lighter_price = float(live_l)
                 if action == "close":
@@ -1363,23 +1335,6 @@ class Executor:
                     posted_ok, _bps, posted_why = open_sides_allowed(
                         lighter_side, arcus_side, float(live_l), float(arcus.price), None,
                     )
-                    if posted_ok and not filled_a:
-                        qty = float(quantity if quantity is not None else lighter_quantity)
-                        check_l = float(lighter.price) if (lighter.price and not filled_l) else float(live_l)
-                        trip_ok, _net, trip_why = open_join_round_trip_allowed(
-                            lighter_side, arcus_side, check_l, float(arcus.price),
-                            qty, float(self.settings.pnl_close_usd),
-                        )
-                        if not trip_ok:
-                            posted_ok, posted_why = False, trip_why
-                    if still_ok and not filled_l and not filled_a:
-                        qty = float(quantity if quantity is not None else lighter_quantity)
-                        live_ok, _net, live_why = open_join_round_trip_allowed(
-                            lighter_side, arcus_side, float(live_l), float(live_a),
-                            qty, float(self.settings.pnl_close_usd),
-                        )
-                        if not live_ok:
-                            still_ok, still_why = False, live_why
                 if action == "close" and not quotes.get("force_close") and (filled_l ^ filled_a):
                     # 一边已经成交：另一边必须还挂在能通过差额的价格上。过不了就撤，不吃单。
                     check_l = float(lighter.price) if lighter.price else float(live_l)

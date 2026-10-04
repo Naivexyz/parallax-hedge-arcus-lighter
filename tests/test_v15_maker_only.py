@@ -1,7 +1,6 @@
-"""v1.5：两边都做 maker。浮盈亏差额只读面板，不写死 0.02。
+"""两边都做 maker。所间价差不拦开仓。浮盈亏差额只看每一边自己的价格变化。
 
-这些用例在旧行为上会失败：孤腿吃单、价差已经亏过差额仍开仓、
-盘口走了还不撤 Arcus、最长持有改 IOC。
+孤腿不吃单，盘口方向反了要撤，最长持有不改 IOC。
 """
 import asyncio
 from pathlib import Path
@@ -9,8 +8,8 @@ from pathlib import Path
 import pytest
 
 from parallax_hedge.config import Settings
-from parallax_hedge.execution import Executor, LegResult
-from parallax_hedge.spread_gate import open_round_trip_allowed
+from parallax_hedge.execution import Executor, LegResult, _close_send_allowed
+from parallax_hedge.spread_gate import round_trip_close_net, unrealized_close_ready
 
 
 def run(coro):
@@ -24,51 +23,70 @@ def _settings(**kw):
     return Settings(**base)
 
 
-def test_open_round_trip_follows_the_panel_value_not_a_constant():
-    """买 100、卖 100.03、数量 1，锁住 -0.03。差额 0.02 不开，0.05 开。"""
-    bad, net, why = open_round_trip_allowed(100.0, 100.03, 1.0, 0.02)
-    assert net == pytest.approx(-0.03)
-    assert bad is False and "-0.02" in why
-    ok, net2, why2 = open_round_trip_allowed(100.0, 100.03, 1.0, 0.05)
-    assert ok and net2 == pytest.approx(-0.03) and "-0.05" in why2
-    # 正好等于差额，可以开（和浮盈亏平仓同一条边界）。
-    edge, _, _ = open_round_trip_allowed(100.0, 100.02, 1.0, 0.02)
-    assert edge is True
-
-
-def test_place_maker_pair_refuses_an_open_worse_than_the_panel_tolerance():
+def test_a_standing_premium_still_posts_both_makers():
+    """买 100、卖 100.17（约 17 bp）。所间价差不拦。差额 0.02 也两边都挂 maker。"""
     sent = []
 
     async def boom(*_a, **_k):
         sent.append("sent")
-        raise AssertionError("差额不够就不该发单")
+        raise AssertionError("演练不该真的发单")
 
-    tight = _settings(pnl_close_usd=0.02, dry_run=True)
-    ex = Executor(tight, market=None, dry_run=True)
+    ex = Executor(_settings(pnl_close_usd=0.02, dry_run=True), market=None, dry_run=True)
     ex._arcus_place = boom
     ex._lighter_post_only = boom
 
-    async def go(executor):
-        return await executor.place_maker_pair(
-            market={"lighter_symbol": "SPY", "lighter_market_index": 1, "arcus_market_id": 2},
-            lighter_side="buy", arcus_side="sell",
-            lighter_quantity=1.0, arcus_quantity=1.0,
-            lighter_price=100.0, arcus_price=100.03,
-            lighter_decimals=(2, 2), quotes={}, action="open", quantity=1.0,
-        )
-
-    refused = run(go(ex))
-    assert refused.ok is False and refused.stage == "spread_wait"
-    assert refused.quotes["pnl_close_usd"] == pytest.approx(0.02)
-    assert refused.quotes["estimated_open_net"] == pytest.approx(-0.03)
+    result = run(ex.place_maker_pair(
+        market={"lighter_symbol": "SPY", "lighter_market_index": 1, "arcus_market_id": 2},
+        lighter_side="buy", arcus_side="sell",
+        lighter_quantity=1.0, arcus_quantity=1.0,
+        lighter_price=100.0, arcus_price=100.17,
+        lighter_decimals=(2, 2), quotes={}, action="open", quantity=1.0,
+    ))
+    assert result.ok and result.dry_run and result.stage == "dry_run"
     assert sent == []
+    assert result.lighter.raw["post_only"] is True
+    assert result.lighter.raw["side"] == "buy" and result.lighter.raw["price"] == pytest.approx(100.0)
+    assert result.arcus.raw["timeInForce"] == "ALO"
+    assert result.arcus.raw["side"] == "sell" and result.arcus.raw["price"] == pytest.approx(100.17)
+    assert "estimated_open_net" not in result.quotes
 
-    wider = _settings(pnl_close_usd=0.05, dry_run=True)
-    ex2 = Executor(wider, market=None, dry_run=True)
-    allowed = run(go(ex2))
-    assert allowed.ok and allowed.dry_run
-    assert allowed.quotes["estimated_open_net"] == pytest.approx(-0.03)
-    assert allowed.lighter.raw["post_only"] and allowed.arcus.raw["timeInForce"] == "ALO"
+
+def test_paired_maker_close_ignores_the_cross_venue_premium():
+    """各边平仓价等于自己的开仓价，两所差 17 bp，合计是 0，差额 0.02 允许平。"""
+    net = round_trip_close_net(1.0, 100.0, 100.0, -1.0, 100.17, 100.17)
+    assert net == pytest.approx(0.0)
+    assert unrealized_close_ready(net, 0.02)
+    # 只有一边自己的价格动了：Lighter 从 100 平到 99.97，亏 0.03，差额 0.02 先不平。
+    moved = round_trip_close_net(1.0, 100.0, 99.97, -1.0, 100.17, 100.17)
+    assert moved == pytest.approx(-0.03)
+    assert not unrealized_close_ready(moved, 0.02)
+    assert unrealized_close_ready(moved, 0.05)
+
+    ex = Executor(_settings(pnl_close_usd=0.02, dry_run=True), market=None, dry_run=True)
+    quotes = {
+        "pnl_close_usd": 0.02,
+        "force_close": False,
+        "close_entries": {
+            "lighter_size": 1.0, "arcus_size": -1.0,
+            "lighter_entry": 100.0, "arcus_entry": 100.17,
+        },
+    }
+    result = run(ex.place_maker_pair(
+        market={"lighter_symbol": "SPY", "lighter_market_index": 1, "arcus_market_id": 2},
+        lighter_side="sell", arcus_side="buy",
+        lighter_quantity=1.0, arcus_quantity=1.0,
+        lighter_price=100.0, arcus_price=100.17,
+        lighter_decimals=(2, 2), quotes=quotes, action="close", reduce_only=True,
+    ))
+    assert result.ok and result.stage == "closed"
+    assert result.lighter.raw["post_only"] and result.arcus.raw["timeInForce"] == "ALO"
+    assert result.lighter.raw["price"] == pytest.approx(100.0)
+    assert result.arcus.raw["price"] == pytest.approx(100.17)
+    allowed, why = _close_send_allowed(quotes, 100.0, 100.17)
+    assert allowed and "+0.0000" in why
+    blocked, why_bad = _close_send_allowed(quotes, 99.97, 100.17)
+    assert blocked is False and "-0.0300" in why_bad
+    assert quotes["pnl_close_usd"] == pytest.approx(0.02)
 
 
 def test_one_leg_flatten_rests_an_arcus_maker_and_does_not_ioc():
@@ -108,7 +126,7 @@ def test_one_leg_flatten_rests_an_arcus_maker_and_does_not_ioc():
 
 
 def test_a_book_move_cancels_resting_arcus_before_it_fills():
-    """Arcus 已经挂着、还没成交，盘口让往返差于面板差额：先撤，不吃单。"""
+    """买的一边不再更便宜：先撤还没成交的 Arcus，不吃单。所间价差变宽本身不撤。"""
     ex = Executor(_settings(pnl_close_usd=0.05), market=object(), dry_run=False)
     sent = []
     phase = {"n": 0}
@@ -118,17 +136,17 @@ def test_a_book_move_cancels_resting_arcus_before_it_fills():
 
     async def fresh(market, lighter_side, arcus_side, closing=False):
         phase["n"] += 1
-        # 前两次（发 Arcus、发 Lighter 之前）还在差额里。第三次盘口拉开。
+        # 前两次买 100、卖 100.20，价差宽也过。第三次买价不再低于卖价。
         if phase["n"] < 3:
-            return True, "先过", 100.0, 100.01
-        return True, "拉开了", 100.0, 101.0
+            return True, "先过", 100.0, 100.20
+        return False, "买价 102 不低于卖价 100.2，不下单", 102.0, 100.20
 
     async def place_arcus(*a, **k):
         sent.append(("arcus", k.get("time_in_force") if False else a[-1] if a else "ALO"))
         # _arcus_place(market, side, qty, price, reduce_only, tif)
         tif = a[5] if len(a) > 5 else "ALO"
         sent[-1] = ("arcus", tif)
-        return LegResult("arcus", True, submitted=True, raw={"orderId": "a1"}, price=100.01)
+        return LegResult("arcus", True, submitted=True, raw={"orderId": "a1"}, price=a[3] if len(a) > 3 else 100.20)
 
     async def place_lighter(*a, **k):
         sent.append(("lighter", "POST_ONLY"))
@@ -157,7 +175,7 @@ def test_a_book_move_cancels_resting_arcus_before_it_fills():
                 "arcus_symbol": "QQQ-USD"},
         lighter_side="buy", arcus_side="sell",
         lighter_quantity=1.0, arcus_quantity=1.0,
-        lighter_price=100.0, arcus_price=100.01,
+        lighter_price=100.0, arcus_price=100.20,
         lighter_decimals=(2, 2), quotes={}, action="open", quantity=1.0,
     ))
     assert result.ok is False and result.stage == "spread_wait"
@@ -165,7 +183,7 @@ def test_a_book_move_cancels_resting_arcus_before_it_fills():
     assert "ioc" not in sent
     assert sent[0] == ("arcus", "ALO")
     # 撤单发生在成交之前：仓位读数一直是 0，没有吃单。
-    assert result.reason and ("差于" in result.reason or "不下" in result.reason or "还回去" in result.reason)
+    assert result.reason and ("不低于" in result.reason or "不下" in result.reason)
 
 
 def test_max_hold_does_not_send_a_taker_when_the_touch_fails():

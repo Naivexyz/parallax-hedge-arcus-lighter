@@ -1,14 +1,12 @@
 """Arcus 与 Lighter 的开仓方向闸门，以及平仓用的浮盈亏差额。
 
 开仓、补仓：买更便宜的一边，卖更贵的一边。买价必须严格低于卖价。
-不再用绝对价差多少 bp 决定开不开。但两边 maker 挂单价锁住的往返
-（平仓要还回去的价差，USDC）已经差于面板「浮盈亏差额」时，两边都不发。
-差额就是面板那一个数，开和平用同一个。
+两所之间长期存在的价差不是亏损。两边一起挂 maker 开、一起挂 maker 平，
+所间价差会原样还回去。不用它拦截开仓。
 
-计划内平仓不看价差，也不看 bp。两腿都成交并过了最短持有之后，
-发单前用两边即将挂出的价格重算往返盈亏，不能只看标记浮盈亏。
-估算亏损差于「浮盈亏差额」就先不发，等到最长持有。
-差额 0.02 时，按挂单价估算的合计 0、-0.02 都平，更差先不平。
+计划内平仓只看每一边自己的开仓价和自己的 maker 平仓价。
+两腿加总差于面板「浮盈亏差额」就先不发，继续挂着。
+两边书没动时，这个合计接近 0，可以平。差额默认 0.02：合计 0、-0.02 都平，更差先不平。
 正常平仓两边都挂 maker。风控触发的平仓仍然立刻吃单。
 
 闸门不挑币种：面板里已经能交易的重叠市场都走同一套，包括美股永续。
@@ -171,68 +169,6 @@ def open_sides_allowed(
     return order_prices_allowed(prices[0], prices[1], max_bps)
 
 
-def locked_open_net(buy_price: float, sell_price: float, quantity: float) -> float | None:
-    """开仓两边 maker 挂单价锁住的往返，单位 USDC。
-
-    买在更便宜的一边、卖在更贵的一边，当下看起来是赚的。
-    平仓要把这个价差还回去，所以预期净盈亏 = (买价 - 卖价) × 数量，是负数。
-    数量取绝对值。价格或数量无效时返回 None。
-    """
-    try:
-        buy = float(buy_price)
-        sell = float(sell_price)
-        qty = abs(float(quantity))
-    except (TypeError, ValueError):
-        return None
-    if buy != buy or sell != sell or qty != qty:
-        return None
-    if buy <= 0 or sell <= 0 or qty <= 0:
-        return None
-    if buy in (float("inf"), float("-inf")) or sell in (float("inf"), float("-inf")):
-        return None
-    return (buy - sell) * qty
-
-
-def open_round_trip_allowed(
-    buy_price: float, sell_price: float, quantity: float, tolerance_usd: float,
-) -> tuple[bool, float | None, str]:
-    """开仓前：锁住的往返已经差于面板「浮盈亏差额」就不发单。
-
-    tolerance_usd 就是面板上的浮盈亏差额，不是另一道阈值。
-    用户改成 0.05 或 0.01，这里跟着变。净盈亏不低于 -差额才开。
-    """
-    net = locked_open_net(buy_price, sell_price, quantity)
-    if net is None:
-        return False, None, "开仓往返估算不出来，不下单"
-    try:
-        window = float(tolerance_usd)
-    except (TypeError, ValueError):
-        return False, net, "浮盈亏差额无效，不下单"
-    if window != window or window in (float("inf"), float("-inf")):
-        return False, net, "浮盈亏差额无效，不下单"
-    if window < 0:
-        window = 0.0
-    if not unrealized_close_ready(net, window):
-        return False, net, (
-            f"按两边挂单价估算往返 {net:+.4f} USDC，"
-            f"已经差于 -{window:g}，这个价差平仓时要还回去，两边都不下"
-        )
-    return True, net, (
-        f"按两边挂单价估算往返 {net:+.4f} USDC，没有差于 -{window:g}"
-    )
-
-
-def open_join_round_trip_allowed(
-    lighter_side: str, arcus_side: str, lighter_price: float, arcus_price: float,
-    quantity: float, tolerance_usd: float,
-) -> tuple[bool, float | None, str]:
-    """用两条腿的 maker 挂单价估算开仓往返。"""
-    prices = buy_sell_prices(lighter_side, arcus_side, lighter_price, arcus_price)
-    if prices is None:
-        return False, None, "两条腿不是一买一卖，不下单"
-    return open_round_trip_allowed(prices[0], prices[1], quantity, tolerance_usd)
-
-
 def maker_exit_price(
     side: str, entry: float, quantity: float, join: float,
     best_bid: float | None, best_ask: float | None, tolerance_usd: float,
@@ -323,9 +259,10 @@ def round_trip_close_net(
     lighter_size: float, lighter_entry: float | None, lighter_close: float,
     arcus_size: float, arcus_entry: float | None, arcus_close: float,
 ) -> float | None:
-    """用即将发出的平仓价估算两边合起来的往返盈亏，不用标记价。
+    """每一边自己的开仓价对上自己的 maker 平仓价，再加总。不用标记价。
 
     带符号数量：多头为正。盈亏 = (平仓价 - 开仓价) × 数量，空头同样成立。
+    两所之间的价差不算进这笔亏损。两边平仓价等于各自开仓价时，合计是 0。
     缺开仓价、或价格无效时返回 None。调用方不能改用标记浮盈亏放行。
     """
     total = 0.0

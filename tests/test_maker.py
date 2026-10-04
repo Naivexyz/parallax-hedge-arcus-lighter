@@ -472,13 +472,15 @@ def test_clean_hedges_are_booked_as_confirmed():
 
 
 def test_open_does_not_quote_the_expensive_side():
-    """Arcus 卖一已经低于 Lighter 的买价：这是贵的一边，一张单都不能挂。"""
+    """买 Lighter 的价高于卖 Arcus 的价：贵的一边也挂 maker，不因为价差拒绝。"""
     w = World(bbo=(2679.90, 2680.00), fills={2: 0.5})
     ex, r = open_(w)
-    assert r.ok is False
-    assert w.placed == []
-    assert w.lighter_orders == []
-    assert any("不下单" in n for n in r.notes)
+    assert r.ok and r.stage == "opened"
+    alo = [p for p in w.placed if p["tif"] == "ALO"]
+    assert alo and alo[0]["side"] == "sell"
+    assert not any(p["tif"] == "IOC" for p in w.placed)
+    assert w.lighter_orders and w.lighter_orders[0][0] == "buy"
+    assert not any("不下单" in n for n in r.notes)
 
 
 def test_eth_prints_post_when_the_buy_is_cheaper_even_if_wide():
@@ -497,28 +499,25 @@ def test_eth_prints_post_when_the_buy_is_cheaper_even_if_wide():
 
 
 def test_a_requote_rechecks_the_live_lighter_hedge_and_still_hedges_a_fill():
-    """第一口价差够紧可以挂。改价时 Lighter 对冲价变成 2662.56、Arcus 变成 2663.43，
-    不能再挂。已经成交的 Arcus 腿仍然对冲，方向仍是买 Lighter、卖 Arcus。"""
+    """盘口挪了可以跟新的买一/卖一。所间价差变宽不拒绝第二口，也不把 Arcus 改成吃单。
+    已经成交的部分仍然对冲，方向仍是买 Lighter、卖 Arcus。"""
     w = World(
         bbo=(2663.40, 2663.55),
         bbo_script=[(2663.40, 2663.55), (2663.30, 2663.44)],
         lighter_bbo=(2663.20, 2663.40),
-        # 第一口挂单、挂上之后立刻复查，这两次都还是好价；成交之后才变成坏价。
         lighter_bbo_script=[(2663.20, 2663.40), (2663.20, 2663.40), (2664.00, 2664.20)],
         fills={2: 0.1502},
     )
     ex, r = open_(w, quantity=0.3004, wait=12)
     alo = [p for p in w.placed if p["tif"] == "ALO"]
-    assert len(alo) == 1
-    assert alo[0]["side"] == "sell"
+    assert alo and all(p["side"] == "sell" for p in alo)
     assert alo[0]["price"] == pytest.approx(2663.54)
-    assert all(p["price"] != pytest.approx(2663.43) for p in alo)
-    assert w.cancels  # 改价前先撤，坏价差不再挂回去
+    assert not any(p["tif"] == "IOC" for p in w.placed)
     assert w.lighter_orders and w.lighter_orders[0][0] == "buy"
     assert w.lighter == pytest.approx(0.1502)
     assert w.arcus == pytest.approx(-0.1502)
     assert r.ok
-    assert any("不下单" in n for n in r.notes)
+    assert not any("不下单" in n for n in r.notes)
 
 
 def test_a_tight_book_still_buys_the_cheaper_lighter_ask():
@@ -542,13 +541,7 @@ def _open_short_lighter(world, quantity=0.5, wait=45.0):
 
 
 def test_several_rejected_quotes_are_not_followed_by_a_place():
-    """2026-10-03 BTC：连续几口被拒之后不能再挂，也不能把旧单留着成交。
-
-    买价不低于卖价，或者绝对价差宽于 1 bp，都是拒绝。拒绝理由可以记下来，
-    但后面不能跟着一张 Arcus 挂单，更不能去 Lighter 对冲。
-    """
-    # 四口都是买价不低于卖价。最后一口以前因为「便宜但宽于 1 bp」被拒，
-    # 宽度不再拦截，所以这里改成方向也不对，确认拒绝之后不会留单。
+    """买价不低于卖价也不拒绝。连续几口都挂 ALO，不把 Arcus 改成吃单。"""
     w = World(
         bbo=(2686.50, 2686.70),
         bbo_script=[
@@ -568,46 +561,33 @@ def test_several_rejected_quotes_are_not_followed_by_a_place():
     )
     ex, r = _open_short_lighter(w, quantity=0.5, wait=6)
     alo = [p for p in w.placed if p["tif"] == "ALO"]
-    assert alo == []
-    assert w.lighter_orders == []
-    assert w.arcus == 0.0 and w.lighter == 0.0
-    assert r.ok is False
-    assert sum("不下单" in n for n in r.notes) >= 4
+    assert alo
+    assert all(p["side"] == "buy" and p["tif"] == "ALO" for p in alo)
+    assert not any(p["tif"] == "IOC" for p in w.placed)
+    assert not any("不下单" in n for n in r.notes)
 
 
 def test_a_stale_live_order_is_cancelled_before_it_can_fill():
-    """先按合格的价挂上。Lighter 对冲价随即变差：必须在下一轮等待之前撤掉，
-    不能留到 3 秒后的改价才撤。撤单前已经成交的部分仍然对冲。
+    """所间价差变差不撤已经挂着的 maker。成交的部分仍然对冲，Arcus 不改吃单。
     """
     w = World(
         bbo=(2686.00, 2686.10),
-        bbo_script=[
-            (2686.00, 2686.10),   # 买 2686.01，对 2686.20，约 0.7 bp，可以挂
-            (2686.00, 2686.10),
-            (2686.40, 2686.60),
-            (2686.80, 2687.00),
-        ],
         lighter_bbo=(2686.20, 2686.30),
         lighter_bbo_script=[
-            (2686.20, 2686.30),   # 挂单时
-            (2685.00, 2685.10),   # 挂上立刻复查：买 2686.01 不低于卖 2685.00
+            (2686.20, 2686.30),
+            (2685.00, 2685.10),   # 对冲价变差，买价不再低于卖价，也不撤
             (2684.50, 2684.60),
             (2684.00, 2684.10),
         ],
-        fills={4: 0.5, 6: 0.5, 8: 0.5},
-        cancel_fill=0.2,
+        fills={4: 0.5},
     )
     ex, r = _open_short_lighter(w, quantity=0.5, wait=8)
     alo = [p for p in w.placed if p["tif"] == "ALO"]
-    assert len(alo) == 1
-    assert alo[0]["side"] == "buy"
+    assert alo and alo[0]["side"] == "buy"
     assert alo[0]["price"] == pytest.approx(2686.01)
-    assert w.cancels
-    assert not any(o["live"] for o in w.orders.values())
-    # 旧单若没撤，poll 4/6/8 会把 0.5 打满。撤单时只允许那 0.2 的竞态成交。
-    assert w.arcus == pytest.approx(0.2)
-    assert w.lighter == pytest.approx(-0.2)
+    assert not any(p["tif"] == "IOC" for p in w.placed)
+    assert w.cancels == []
     assert w.lighter_orders and w.lighter_orders[0][0] == "sell"
     assert r.ok
-    assert any("不下单" in n for n in r.notes)
+    assert not any("不下单" in n for n in r.notes)
     assert any("挂单成交" in n for n in r.notes)

@@ -539,13 +539,10 @@ class MakerExecutor:
         self, market: dict[str, Any], lighter_side: str, arcus_side: str,
         arcus_price: float, state: dict[str, Any],
     ) -> tuple[bool, str]:
-        """新挂或改价之前：重读 Lighter 对冲价。买价必须严格低于卖价，不看 bp 宽度。"""
+        """新挂或改价之前：读得到 Lighter 盘口就挂。所间价差不拒绝。"""
         if not await self._refresh_ref(market, lighter_side, state):
             return False, "读不到 Lighter 实时对冲价，不下单"
-        ok, _bps, why = open_sides_allowed(
-            lighter_side, arcus_side, state["ref"], float(arcus_price), None,
-        )
-        return ok, why
+        return True, "所间价差不拦开仓"
 
     @staticmethod
     def _attribute(run: MakerRun, confirmed: float) -> None:

@@ -395,12 +395,12 @@ async function loadTasks() {
     renderUnmanaged(t.unmanaged);
     const banner = $('dry-banner');
     banner.className = 'dry-banner' + (t.dry_run ? '' : ' live');
-    const gateNote = ` <b>开仓</b>：买更便宜的一边、卖更贵的一边。买价必须严格低于卖价。所间价差不拦开仓。`
-      + `Arcus 先挂 maker（0 费），Lighter 也挂 maker。一边成交不去吃另一边。`
+    const gateNote = ` <b>开仓</b>：不要求买在更便宜的一边。所间价差不拦开仓。`
+      + `两边一起挂 maker（0 费）。只成交一边时，未成交的留着，已成交的另挂 post-only，不吃单。`
       + `两腿都成交后至少持有 ${esc(t.min_hold_sec ?? 3)} 秒。`
       + `之后看每一边自己的开仓价对上自己的平仓价，合计不低于 -${esc(t.pnl_close_usd ?? 0.02)} USDC 就挂 maker 平。所间价差不算亏损。`
       + `<b>持有满 ${esc(t.max_hold_sec ?? 300)} 秒可以跟盘挂 maker，不改吃单。</b>`
-      + `只成交一边就挂 maker 退出。`
+      + `关掉程序会撤掉挂单，并把还开着的仓位挂 maker 平掉。`
       + `同一套规则用于全部重叠市场，包括美股永续。风控平仓仍立刻吃单。`;
     banner.innerHTML = t.dry_run
       ? `<b>演练模式</b> —— 引擎照常做全部判断并记录意图，但<b>不会提交任何订单</b>。`

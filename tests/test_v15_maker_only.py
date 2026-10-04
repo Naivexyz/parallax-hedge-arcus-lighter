@@ -126,7 +126,7 @@ def test_one_leg_flatten_rests_an_arcus_maker_and_does_not_ioc():
 
 
 def test_a_book_move_cancels_resting_arcus_before_it_fills():
-    """买的一边不再更便宜：先撤还没成交的 Arcus，不吃单。所间价差变宽本身不撤。"""
+    """买价不再低于卖价也不撤。两腿都没成交才在等待结束时一起撤，不吃单。"""
     ex = Executor(_settings(pnl_close_usd=0.05), market=object(), dry_run=False)
     sent = []
     phase = {"n": 0}
@@ -136,10 +136,8 @@ def test_a_book_move_cancels_resting_arcus_before_it_fills():
 
     async def fresh(market, lighter_side, arcus_side, closing=False):
         phase["n"] += 1
-        # 前两次买 100、卖 100.20，价差宽也过。第三次买价不再低于卖价。
-        if phase["n"] < 3:
-            return True, "先过", 100.0, 100.20
-        return False, "买价 102 不低于卖价 100.2，不下单", 102.0, 100.20
+        # 买价高于卖价也继续挂。价不变，不因为所间价差去撤。
+        return True, "买价不低于卖价也挂", 102.0, 100.20
 
     async def place_arcus(*a, **k):
         sent.append(("arcus", k.get("time_in_force") if False else a[-1] if a else "ALO"))
@@ -178,12 +176,11 @@ def test_a_book_move_cancels_resting_arcus_before_it_fills():
         lighter_price=100.0, arcus_price=100.20,
         lighter_decimals=(2, 2), quotes={}, action="open", quantity=1.0,
     ))
-    assert result.ok is False and result.stage == "spread_wait"
-    assert "cancel" in sent
+    assert result.ok is False and result.stage == "legs_timeout"
     assert "ioc" not in sent
-    assert sent[0] == ("arcus", "ALO")
-    # 撤单发生在成交之前：仓位读数一直是 0，没有吃单。
-    assert result.reason and ("不低于" in result.reason or "不下" in result.reason)
+    assert ("arcus", "ALO") in sent
+    assert ("lighter", "POST_ONLY") in sent
+    assert result.reason and "不低于" not in result.reason
 
 
 def test_max_hold_does_not_send_a_taker_when_the_touch_fails():
@@ -255,8 +252,8 @@ def test_max_hold_does_not_send_a_taker_when_the_touch_fails():
         lighter_price=100.0, arcus_price=100.0,
         lighter_decimals=(2, 2), quotes=quotes, action="close", reduce_only=True,
     ))
-    assert result.ok is False
     assert "ioc" not in sent
     assert ("arcus", "ALO") in sent
-    assert "cancel" in sent
     assert ("lighter", "POST_ONLY") in sent
+    assert result.quotes.get("exit_post_only") is True
+    assert "cancel" not in sent

@@ -36,7 +36,7 @@ from .risk import (
 from .ledger import ledger_rows_for_result
 from .scheduler import CycleDecision, TaskState, decide, draw_hold_hours
 from .service import FundingService
-from .spread_gate import evaluate_books, join_price, open_sides_allowed, round_trip_close_net, unrealized_close_ready
+from .spread_gate import join_price, round_trip_close_net, unrealized_close_ready
 from .store import Store
 
 # 开仓后复核的重试节奏：Lighter 是 rollup，账户接口要几秒才反映新仓位。
@@ -101,16 +101,111 @@ class HedgeEngine:
         # 补仓完成后，下一轮要重设各任务的强平距离基准（仓位变大是机械变化，不是行情）
         self._rebase_note: str | None = None
         self.bell = None
+        # 已经按成交价挂过刮单的币。单腿不是一种持仓状态，不能每轮再报一次、再挂一次。
+        self._scratch_posted: dict[str, tuple[str, float]] = {}
 
     async def aclose(self) -> None:
-        # 关程序时挂单任务还在跑：取消它（任务会尽力撤掉 Arcus 上的挂单）
+        # 停机：先叫停挂单任务，再撤掉还挂着的单，并把每个非零仓位挂 maker 平掉。
+        for event in self._stops.values():
+            event.set()
         for job in self._jobs.values():
             if not job.done():
                 job.cancel()
         for job in self._jobs.values():
             with contextlib.suppress(BaseException):
                 await job
+        with contextlib.suppress(Exception):
+            await self.shutdown_flatten()
         await self.executor.aclose()
+
+    async def shutdown_flatten(self) -> list[dict[str, Any]]:
+        """进程退出：撤挂单，每个还开着的仓位挂 post-only 退出。
+
+        Arcus 不吃单（吃单费 2.25 bp 是漏损）。Lighter 同样挂 maker。
+        仓位还在就撤掉没成交的退出单、按新的买一/卖一再挂，直到平完或等到挂单时限。
+        """
+        try:
+            markets = await self.service.client.common_markets()
+        except Exception:  # noqa: BLE001
+            markets = []
+        report: list[dict[str, Any]] = []
+        for market in markets:
+            with contextlib.suppress(Exception):
+                await self.executor.cancel_resting_for_shutdown(market)
+        deadline = time.monotonic() + max(5.0, float(self.settings.maker_wait_seconds))
+        while True:
+            legs = await self._shutdown_open_legs(markets)
+            if not legs:
+                break
+            if not self.dry_run and time.monotonic() >= deadline:
+                for market, venue, size, _decimals, _price in legs:
+                    asset = str(market.get("asset") or market.get("lighter_symbol") or "?")
+                    self.store.log_cycle(
+                        asset, "shutdown_left",
+                        f"停机时 {venue} 还剩 {size:g}，maker 退出没在时限内成交，不改吃单",
+                        urgent=True, dry_run=self.dry_run,
+                    )
+                break
+            for market, venue, size, decimals, price in legs:
+                leg = await self.executor.flatten_orphan(
+                    market=market, venue=venue, size=size, price=price,
+                    slippage_bps=float(self.settings.order_slippage_bps),
+                    lighter_decimals=decimals, entry_price=price,
+                )
+                asset = str(market.get("asset") or market.get("lighter_symbol") or "?")
+                report.append({
+                    "asset": asset, "venue": venue, "size": size,
+                    "side": leg.side, "ok": leg.ok, "price": leg.price,
+                    "post_only": True,
+                })
+                self.store.log_cycle(
+                    asset, "shutdown_flatten",
+                    f"停机：{venue} {leg.side or ''} {abs(size):g} 挂 maker 退出，不吃单",
+                    dry_run=self.dry_run,
+                    result={"ok": leg.ok, "error": leg.error, "price": leg.price},
+                )
+            if self.dry_run:
+                break
+            # 只挂一次。刮单还在等成交时不再撤掉重挂，也不再记一笔失败。
+            deadline_left = deadline - time.monotonic()
+            while deadline_left > 0:
+                if not await self._shutdown_open_legs(markets):
+                    break
+                await asyncio.sleep(min(0.35, deadline_left))
+                deadline_left = deadline - time.monotonic()
+            break
+        return report
+
+    async def _shutdown_open_legs(
+        self, markets: list[dict[str, Any]],
+    ) -> list[tuple[dict[str, Any], str, float, tuple[int, int], float]]:
+        found = []
+        for market in markets:
+            try:
+                lighter, arcus = await self.executor.read_positions(
+                    market["lighter_symbol"], int(market["arcus_market_id"]),
+                )
+                decimals = await self._lighter_decimals(market)
+            except Exception:  # noqa: BLE001
+                continue
+            for venue, size in (("lighter", lighter), ("arcus", arcus)):
+                try:
+                    size_f = float(size)
+                except (TypeError, ValueError):
+                    continue
+                if size_f != size_f or abs(size_f) <= 1e-9:
+                    continue
+                price = await self._shutdown_touch(market, venue, size_f)
+                found.append((market, venue, size_f, decimals, price))
+        return found
+
+    async def _shutdown_touch(self, market: dict[str, Any], venue: str, size: float) -> float:
+        side = "sell" if size > 0 else "buy"
+        try:
+            _bid, _ask, join = await self.executor._touch(market, venue, side)
+        except Exception:  # noqa: BLE001
+            return 0.0
+        return float(join) if join else 0.0
 
     # ── 一个周期 ────────────────────────────────────
     async def run_cycle(self) -> list[dict[str, Any]]:
@@ -333,6 +428,21 @@ class HedgeEngine:
                     f"{reason}（Lighter 可用 {available[0]:.2f} / "
                     f"Arcus 可用 {available[1]:.2f} USDC，价格 {price or 0:.4f}）"
                 )
+            if decision.plan != "flatten_orphan":
+                self._scratch_posted.pop(asset, None)
+            else:
+                prev = self._scratch_posted.get(asset)
+                size = float(decision.orphan_size or 0)
+                if (
+                    prev is not None and prev[0] == decision.orphan_venue
+                    and prev[1] != 0 and size != 0 and (prev[1] > 0) == (size > 0)
+                ):
+                    decisions.append({
+                        "asset": asset, "plan": "idle",
+                        "reason": "单腿刮单已挂在成交价，不再重复下单",
+                        "urgent": False, "result": None,
+                    })
+                    continue
             if self._runs_as_maker(decision):
                 # 挂单要等成交（最多 MAKER_WAIT_SECONDS 秒）：放到后台跑，
                 # 引擎照常每 20 秒检查其它币种的风控，不被这一个币拖住
@@ -399,9 +509,12 @@ class HedgeEngine:
                     # 价差闸门没过：还没下单，不是开仓失败
                     logged_plan, logged_reason = "spread_wait", result.reason or "价差过宽，不开仓"
                 elif result.stage == "close_wait":
-                    logged_plan, logged_reason = "close_wait", result.reason or "平仓买价不低于卖价，先不平"
+                    logged_plan, logged_reason = "close_wait", result.reason or "按各边自己的价格估算差于浮盈亏差额，先不平"
                 elif result.stage == "legs_timeout":
                     logged_plan, logged_reason = "maker_wait", result.reason or "两腿未都成交，已撤单"
+                elif result.stage in ("maker_exit", "flat") or decision.plan == "flatten_orphan":
+                    logged_plan = "maker_exit"
+                    logged_reason = result.reason or "按成交价挂 post-only 刮单，不吃单"
                 elif not result.ok:
                     logged_plan = f"{decision.plan}_failed"
                     logged_reason = f"{result.stage}：{result.reason or '未成功'}"
@@ -504,14 +617,15 @@ class HedgeEngine:
                 entry = health.arcus.entry_price
             leg = await self.executor.flatten_orphan(
                 market=market, venue=venue,
-                size=decision.orphan_size, price=price, slippage_bps=slippage,
-                lighter_decimals=decimals, entry_price=entry,
+                size=decision.orphan_size, price=float(entry or price or 0), slippage_bps=slippage,
+                lighter_decimals=decimals, entry_price=entry or price,
             )
+            self._scratch_posted[asset] = (venue, float(decision.orphan_size or 0))
             return PairResult(
                 leg.ok, "flatten_orphan", reason=decision.reason, dry_run=self.dry_run,
                 lighter=leg if leg.venue == "lighter" else None,
                 arcus=leg if leg.venue == "arcus" else None,
-                notes=["孤腿已平" if leg.ok else "⚠ 孤腿平仓失败，下轮重试"],
+                notes=["已按成交价挂 post-only 刮单，不吃单" if leg.ok else "刮单没挂上，不改吃单，也不再循环重试"],
                 ledger=[("orphan", leg)],
             )
 
@@ -616,23 +730,8 @@ class HedgeEngine:
                     ),
                     dry_run=self.dry_run, quotes=quotes, notes=["尚未下任何单"],
                 )
-            # 方向：买更便宜的卖一、卖更贵的买一。买价不低于卖价就不开。
-            # 不再用价差 bp 阈值拦开仓。
-            gate = evaluate_books(lighter_book, arcus_book)
-            quotes["spread_gate"] = gate.as_dict()
-            if not gate.ok:
-                return PairResult(
-                    False, "spread_wait", reason=gate.reason, dry_run=self.dry_run,
-                    quotes=quotes, notes=["价差闸门未通过，尚未下任何单"],
-                )
-            if topup and gate.direction != (decision.direction or ""):
-                return PairResult(
-                    False, "spread_wait",
-                    reason="盘口方向与持仓方向不一致，不补仓",
-                    dry_run=self.dry_run, quotes=quotes, notes=["尚未下任何单"],
-                )
-            decision = replace(decision, direction=gate.direction)
-            lighter_side, arcus_side = hedge_side(decision.direction or "")
+            # 方向沿用任务里已经定好的对冲方向。不要求买更便宜的一边。
+            # 所间价差（例如 Arcus 80000、Lighter 80001）不拦开仓。
             from .funding import DIRECTION_LABELS
             quotes["direction"] = decision.direction
             quotes["direction_label"] = DIRECTION_LABELS.get(decision.direction or "")
@@ -649,20 +748,8 @@ class HedgeEngine:
                 )
             quotes["lighter_join"] = lighter_join
             quotes["arcus_join"] = float(arcus_join)
-            # 最后一道：用即将挂出去的买价和卖价。买价不低于卖价就不要发。
-            # 价差有多宽不再拦截。
-            prices_ok, join_bps, prices_why = open_sides_allowed(
-                lighter_side, arcus_side, lighter_join, float(arcus_join),
-                None,
-            )
-            quotes["join_gap_bps"] = None if join_bps is None else round(join_bps, 4)
-            quotes["enforce_cheap_side"] = True
-            if not prices_ok:
-                return PairResult(
-                    False, "spread_wait", reason=prices_why, dry_run=self.dry_run,
-                    quotes=quotes, notes=["挂单价没有通过最后一道检查，尚未下任何单"],
-                )
-            # 所间价差不是锁住的亏损。两边都挂 maker 时，开仓不拿浮盈亏差额拦。
+            quotes["enforce_cheap_side"] = False
+            # 所间价差不拦。两边 maker 一起发。
             if topup:
                 # 补仓也要过同一个价差闸门，两边都挂 maker
                 result = await self._place_gated(

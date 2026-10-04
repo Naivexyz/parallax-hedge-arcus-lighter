@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parallax-hedge-arcus"
-version = "1.6.0"
+version = "1.7.0"
 description = "对冲刷量控制台 —— Arcus x RHC Lighter"
 requires-python = ">=3.11"
 dependencies = [

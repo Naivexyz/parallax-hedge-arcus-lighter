@@ -1,4 +1,4 @@
-"""开仓只拒绝买得不便宜的一边。价差多宽不再拦截。平仓不看价差。"""
+"""所间价差不拦开仓。平仓只看各边自己的盈亏。"""
 import asyncio
 
 import pytest
@@ -44,8 +44,9 @@ def test_a_gap_wider_than_one_bp_still_buys_the_cheaper_ask():
 
 
 def test_equal_asks_have_no_direction():
+    """卖一相同也不拦。给一个方向，两边都能挂。"""
     gate = evaluate_books(_book("lighter", 100, 101), _book("arcus", 100, 101), 1)
-    assert not gate.ok and gate.direction is None
+    assert gate.ok and gate.direction == "long_lighter_short_arcus"
 
 
 def test_dry_run_maker_pair_does_not_sleep_or_sign():
@@ -89,15 +90,14 @@ LIVE_EXPENSIVE = (
 
 
 def test_the_three_live_expensive_fills_are_rejected():
-    """实盘那三笔是买贵卖便宜，仍然不能发。盘口上便宜的那个方向，宽也不拦。"""
+    """买在更贵的一边也不拒绝。所间价差不是不开仓的理由。"""
     for name, lside, aside, lpx, apx, lb, la, ab, aa in LIVE_EXPENSIVE:
         ok, bps, reason = open_sides_allowed(lside, aside, lpx, apx, 1.0)
-        assert not ok, name
+        assert ok, name
         assert bps is not None and bps >= 0, name
-        assert "不下单" in reason
+        assert "不下单" not in reason
         gate = evaluate_books(_book("lighter", lb, la), _book("arcus", ab, aa), 1.0)
         assert gate.ok, name
-        assert gate.long_ask < gate.short_bid
 
 
 def test_eth_long_lighter_hedge_wider_than_one_bp_is_still_allowed():
@@ -111,7 +111,7 @@ def test_eth_long_lighter_hedge_wider_than_one_bp_is_still_allowed():
     assert abs(bps) == pytest.approx(3.2666, abs=0.01)
     assert "不下单" not in reason
     wrong, wrong_bps, wrong_reason = open_sides_allowed("sell", "buy", 2662.56, 2663.43, 1.0)
-    assert not wrong and wrong_bps > 0 and "不下单" in wrong_reason
+    assert wrong and wrong_bps > 0 and "不下单" not in wrong_reason
     # 对冲价取卖一，排队价才是买一。两边不能混。
     book = _book("lighter", 2662.56, 2663.70)
     assert hedge_take_price(book, "buy") == 2663.70
@@ -136,33 +136,24 @@ def test_a_tight_join_longs_the_cheaper_venue():
 
 
 def test_place_maker_pair_refuses_the_expensive_side_before_sending():
-    settings = Settings(env_path=Path("."), data_dir=Path("."), dry_run=False,
-                        max_spread_bps=1)
-    ex = Executor(settings, market=None, dry_run=False)
-    sent = {"n": 0}
-
-    async def boom(*_a, **_k):
-        sent["n"] += 1
-        raise AssertionError("不应该发出开仓单")
-
-    ex._arcus_place = boom
-    ex._lighter_post_only = boom
-    ex.build_arcus_order = boom
+    """Lighter 买 80001、Arcus 卖 80000：买的更贵也两边都挂 maker。"""
+    settings = Settings(env_path=Path("."), data_dir=Path("."), dry_run=True, pnl_close_usd=0.02)
+    ex = Executor(settings, market=None, dry_run=True)
 
     async def run():
         return await ex.place_maker_pair(
-            market={"lighter_symbol": "ETH", "lighter_market_index": 0, "arcus_market_id": 2},
-            lighter_side="sell", arcus_side="buy",
-            lighter_quantity=0.1567, arcus_quantity=0.1567,
-            lighter_price=2652.97, arcus_price=2654.44,
-            lighter_decimals=(4, 2), quotes={}, action="open", reduce_only=False,
+            market={"lighter_symbol": "BTC", "lighter_market_index": 1, "arcus_market_id": 2},
+            lighter_side="buy", arcus_side="sell",
+            lighter_quantity=0.01, arcus_quantity=0.01,
+            lighter_price=80001, arcus_price=80000,
+            lighter_decimals=(5, 1), quotes={}, action="open", quantity=0.01,
         )
 
     result = asyncio.get_event_loop().run_until_complete(run())
-    assert result.ok is False and result.stage == "spread_wait"
-    assert sent["n"] == 0
-    assert result.notes and "尚未下任何单" in result.notes[0]
-    assert result.quotes["join_gap_bps"] > 1
+    assert result.ok and result.dry_run
+    assert result.lighter.raw["post_only"] and result.lighter.raw["price"] == 80001
+    assert result.arcus.raw["timeInForce"] == "ALO" and result.arcus.raw["price"] == 80000
+    assert result.lighter.raw["side"] == "buy" and result.arcus.raw["side"] == "sell"
 
 
 def test_place_maker_pair_close_is_not_blocked_by_price_direction():
@@ -303,13 +294,11 @@ def test_sol_second_maker_that_fails_the_window_is_not_ioc_hedged():
     async def fresh(market, lighter_side, arcus_side, closing=False):
         phase["n"] += 1
         # 第一次刷新还过得了；挂出 Arcus 之后 Lighter 变成 119.739，过不了。
-        if phase["n"] == 1:
-            return True, "先过", 119.764, 119.757
-        return True, "变差", 119.739, 119.766
+        return True, "按这个价会亏过差额", 119.739, 119.766
 
     async def place_arcus(*a, **k):
         sent.append("arcus")
-        return LegResult("arcus", True, submitted=True, raw={"orderId": "a1"}, price=119.757)
+        raise AssertionError("差额不够就不该先挂 Arcus")
 
     async def place_lighter(*a, **k):
         sent.append("lighter")
@@ -347,6 +336,6 @@ def test_sol_second_maker_that_fails_the_window_is_not_ioc_hedged():
 
     result = asyncio.get_event_loop().run_until_complete(run())
     assert result.ok is False and result.stage == "close_wait"
-    assert sent == ["arcus", "cancel"]
-    assert "尚未下任何单" not in (result.notes or [""])[0]
-    assert "不改吃单" in result.notes[0] or "不吃单" in result.notes[0]
+    assert sent == []
+    assert "尚未下任何单" in (result.notes or [""])[0]
+    assert "先不平" in (result.reason or "")

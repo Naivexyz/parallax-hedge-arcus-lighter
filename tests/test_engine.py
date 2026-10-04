@@ -139,9 +139,23 @@ def test_orphan_leg_is_flattened_even_when_disabled():
         eng, store, _ = make(tmp, row(0.2, 0.0))          # 只剩 lighter
         store.upsert_task("OAI", enabled=0, leverage=6.0, rotation_hours=4.0,
                           opened_at=time.time() - 3600, corridor_at_open=8.3)
+        calls = {"n": 0}
+        orig = eng.executor.flatten_orphan
+
+        async def once(**kw):
+            calls["n"] += 1
+            return await orig(**kw)
+
+        eng.executor.flatten_orphan = once
         d = run(eng.run_cycle())
         assert d[0]["plan"] == "flatten_orphan"
         assert d[0]["urgent"] is True
+        again = run(eng.run_cycle())
+        assert calls["n"] == 1
+        assert again[0]["plan"] == "idle"
+        assert "抢救" not in (again[0]["reason"] or "")
+        logged = " ".join((row["plan"] or "") + (row["reason"] or "") for row in store.recent_cycles())
+        assert "抢救失败" not in logged
 
 
 def test_narrow_corridor_blocks_opening():
@@ -1262,9 +1276,9 @@ def test_a_healthy_top_up_is_left_running():
 
 
 def test_the_three_live_books_open_the_cheaper_side_even_when_wide():
-    """所间价差十几 bp 也要开。两边一起挂 maker，这个价差不是锁住的亏损。
+    """所间价差十几 bp 也要开。不要求买更便宜的一边。
 
-    方向仍是买更便宜的一边。面板差额保持 0.02，不因为价差宽就改成不开。
+    任务方向是 Lighter 多 / Arcus 空。哪怕这一边更贵，也照样两边挂 maker。
     """
     books = (
         (2652.90, 2652.97, 2654.44, 2654.51),
@@ -1293,11 +1307,11 @@ def test_the_three_live_books_open_the_cheaper_side_even_when_wide():
             assert d[0]["plan"] == "open", d[0]
             task = store.get_task("OAI")
             assert task["opened_at"] is not None
-            cheap = "long_lighter_short_arcus" if la < aa else "short_lighter_long_arcus"
-            assert task["open_direction"] == cheap
+            assert task["open_direction"] == "long_lighter_short_arcus"
             logged = store.recent_cycles()[0]
             assert logged["plan"] == "open"
-            assert "还回去" not in (logged["reason"] or "")
+            assert "贵的一边" not in (logged["reason"] or "")
+            assert "买价不低于" not in (logged["reason"] or "")
 
 
 def _override_books(eng, lighter_bid, lighter_ask, arcus_bid, arcus_ask):

@@ -671,7 +671,11 @@ class HedgeEngine:
             # 每条腿的限价必须来自【该所自己的盘口】，而且是按下单数量
             # 走完档位的 VWAP。共用一个标记价在原理上就是错的：
             # 两所之间有基差，滑点预算一旦盖不住它，单子就永远够不到对手价。
-            lighter_side, arcus_side = hedge_side(decision.direction or "")
+            if topup:
+                lighter_side, arcus_side = hedge_side(decision.direction or "")
+            else:
+                # 开仓不读资金费。先卖 Arcus / 买 Lighter，不成交由执行层翻一次。
+                lighter_side, arcus_side = "buy", "sell"
             # 先设杠杆、再取盘口、再下单。设不上就不开 —— 数量是按这个杠杆算的，
             # 交易所实际用别的杠杆，保证金和强平走廊就全对不上了。
             # 放在取盘口之前：设杠杆要一两秒，别让它夹在报价和下单中间。
@@ -730,11 +734,13 @@ class HedgeEngine:
                     ),
                     dry_run=self.dry_run, quotes=quotes, notes=["尚未下任何单"],
                 )
-            # 方向沿用任务里已经定好的对冲方向。不要求买更便宜的一边。
-            # 所间价差（例如 Arcus 80000、Lighter 80001）不拦开仓。
+            # 开仓方向不看资金费，用上面定好的边（先卖 Arcus，失败再翻）。
+            # 补仓仍沿用已有仓位的方向。所间价差不拦开仓。
+            from .execution import paired_direction
             from .funding import DIRECTION_LABELS
-            quotes["direction"] = decision.direction
-            quotes["direction_label"] = DIRECTION_LABELS.get(decision.direction or "")
+            quotes["direction"] = paired_direction(lighter_side, arcus_side) or decision.direction
+            quotes["direction_label"] = DIRECTION_LABELS.get(quotes["direction"] or "")
+            quotes["funding_picks_open_side"] = False
             from .arcus import passive_price
             arcus_join = passive_price(
                 market, arcus_side, arcus_book.best_bid or 0, arcus_book.best_ask or 0,
@@ -804,7 +810,7 @@ class HedgeEngine:
                 if check is None:
                     # 始终读不到：保留仓位，如实标注，让风控循环接管
                     self.store.mark_opened(
-                        asset, direction=decision.direction or "",
+                        asset, direction=_opened_direction(result, quotes, decision),
                         quantity=opened_quantity, corridor_pct=None,
                         hold_hours=hold_hours, target_quantity=decision.quantity,
                     )
@@ -837,7 +843,7 @@ class HedgeEngine:
                         )
                         return result
                     self.store.mark_opened(
-                        asset, direction=decision.direction or "",
+                        asset, direction=_opened_direction(result, quotes, decision),
                         quantity=opened_quantity,
                         corridor_pct=check.actual_corridor_pct,
                         hold_hours=hold_hours, target_quantity=decision.quantity,
@@ -846,7 +852,7 @@ class HedgeEngine:
             # 演练模式没有真实仓位可复核，退而记录预检的估算值，
             # 好让持仓期间的相对触发有个参照。
             self.store.mark_opened(
-                asset, direction=decision.direction or "",
+                asset, direction=_opened_direction(result, quotes, decision),
                 quantity=opened_quantity,
                 corridor_pct=getattr(pre, "estimated_corridor_pct", None),
                 hold_hours=hold_hours, target_quantity=decision.quantity,
@@ -928,10 +934,13 @@ class HedgeEngine:
         测试替身如果没有 place_maker_pair，就退回它已有的 open_pair。
         """
         # 实盘：Arcus maker 先成交，再 IOC Lighter。没有 place_maker_pair 的替身才退回旧路径。
+        # 开仓的计划里没有资金费方向，用这次实际挂的两边。
+        from .execution import paired_direction
+        direction = decision.direction or paired_direction(lighter_side, arcus_side) or ""
         fn = getattr(self.executor, "place_maker_pair", None)
         if fn is None and self.settings.arcus_maker and not self.dry_run:
             return await self._maker(stop).open_pair(
-                market=market, direction=decision.direction or "",
+                market=market, direction=direction,
                 quantity=decision.quantity,
                 lighter_price=lighter_join, arcus_price=arcus_join,
                 slippage_bps=self.settings.order_slippage_bps,
@@ -939,7 +948,7 @@ class HedgeEngine:
             )
         if fn is None:
             return await self.executor.open_pair(
-                market=market, direction=decision.direction or "",
+                market=market, direction=direction,
                 quantity=decision.quantity, lighter_price=lighter_join,
                 arcus_price=arcus_join, slippage_bps=self.settings.order_slippage_bps,
                 lighter_decimals=decimals, quotes=quotes,
@@ -949,7 +958,7 @@ class HedgeEngine:
             lighter_quantity=decision.quantity, arcus_quantity=decision.quantity,
             lighter_price=lighter_join, arcus_price=arcus_join,
             lighter_decimals=decimals, quotes=quotes, reduce_only=False,
-            action=action, stop=stop, direction=decision.direction,
+            action=action, stop=stop, direction=direction,
             quantity=decision.quantity,
         )
 
@@ -1363,3 +1372,9 @@ def _arcus_available(payload: Any) -> float:
         return 0.0
     balance = arcus_balance(payload)
     return float(balance["available"]) if balance else 0.0
+
+
+def _opened_direction(result: Any, quotes: dict[str, Any], decision: Any) -> str:
+    """实际成交的方向：执行层翻边后写在 filled_direction；替身没写就用这次挂的两边。"""
+    got = (getattr(result, "quotes", None) or {}).get("filled_direction")
+    return str(got or quotes.get("direction") or decision.direction or "")

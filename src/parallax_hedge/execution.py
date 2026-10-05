@@ -42,6 +42,10 @@ from .spread_gate import (
     round_trip_close_net, unrealized_close_ready,
 )
 
+# 开仓每一边最多空挂这么久。到点没成交就撤掉并翻到另一边，不等满 MAKER_WAIT_SECONDS。
+# 会吃单（挪档之后仍是 POST_ONLY_WOULD_CROSS）则立刻翻，不等这 15 秒。只翻一次。
+OPEN_SIDE_ATTEMPT_SEC = 15.0
+
 # 下单后轮询仓位的节奏。Lighter 是链上交易，确认要一点时间；
 # Parallax 用的是 4 次重试，这里沿用。
 _CONFIRM_RETRIES = 4
@@ -59,6 +63,19 @@ _NAKED_GRACE_SEC = 3.0
 def _is_would_cross(error: object) -> bool:
     text = str(error or "").upper().replace(" ", "").replace("-", "_")
     return "POST_ONLY" in text or "WOULD_CROSS" in text or "WOULDCROSS" in text
+
+
+def _other_side(side: str) -> str:
+    return "buy" if side == "sell" else "sell"
+
+
+def paired_direction(lighter_side: str, arcus_side: str) -> str | None:
+    """两条腿必须相反。返回开仓方向名，同向或未知则 None。"""
+    if lighter_side == "buy" and arcus_side == "sell":
+        return "long_lighter_short_arcus"
+    if lighter_side == "sell" and arcus_side == "buy":
+        return "short_lighter_long_arcus"
+    return None
 
 
 def _step_off_cross(side: str, price: float, bid: float | None, ask: float | None, tick: float) -> float:
@@ -1114,7 +1131,8 @@ class Executor:
 
         3 秒 / 300 秒是成交之后的持仓时钟（MIN_HOLD_SEC / MAX_HOLD_SEC），
         由引擎在平仓决策里用，不在这里睡眠。
-        挂单若一直不成交，最多等 MAKER_WAIT_SECONDS 再撤，避免留下单腿。
+        平仓挂单若一直不成交，最多等 MAKER_WAIT_SECONDS 再撤。
+        开仓每一边只等 OPEN_SIDE_ATTEMPT_SEC（默认 15 秒）；会吃单或没成交就翻到另一边，只翻一次。
         演练模式只记录意图，不睡眠、不签名、不提交。
         """
         started = time.monotonic()
@@ -1148,6 +1166,9 @@ class Executor:
                 f"挂 maker 平仓：Lighter {lighter_side} {float(lighter_price):g} / "
                 f"Arcus {arcus_side} {float(arcus_price):g}"
             )
+        named = paired_direction(lighter_side, arcus_side)
+        if named:
+            quotes["filled_direction"] = named
         if self.dry_run:
             lighter = LegResult("lighter", True, raw={
                 "dry_run": True, "side": lighter_side, "quantity": lighter_quantity,
@@ -1228,7 +1249,13 @@ class Executor:
                 f"Arcus {arcus_side} {float(arcus_price):g}"
             )
 
-        # Arcus 先挂。没挂住（含会吃单被拒）就不发 Lighter，避免 Lighter 先成交留下裸腿。
+        # Arcus 先挂。没挂住就不发 Lighter。
+        # 开仓：一边最多挂 open_side_attempt_seconds（默认 15 秒）；挪档后仍会吃单就立刻翻。
+        # 翻之前先撤单并用挂单列表确认，再重读仓位：有成交（含部分）就先 IOC Lighter，不再翻。
+        # 只翻一次。平仓 / 补仓不翻，仍等 MAKER_WAIT_SECONDS，行为和 v1.8 一样。
+        is_open = action == "open"
+        ledger_action = action if action != "topup" else "open"
+
         async def _send_arcus(px: float) -> LegResult:
             if arcus_quantity <= 0:
                 return LegResult("arcus", True, submitted=False, raw={"skipped": "flat"})
@@ -1241,127 +1268,355 @@ class Executor:
                 reduce_only, lighter_decimals,
             )
 
-        arcus = await _send_arcus(float(arcus_price))
-        if arcus_quantity > 0 and not arcus.ok:
-            return PairResult(
-                False, "arcus_not_resting", None, arcus,
-                reason="Arcus 没挂住，Lighter 未发",
-                quotes=quotes, elapsed_ms=(time.monotonic() - started) * 1000,
-                notes=["Lighter 未发"],
-                ledger=[(action if action != "topup" else "open", arcus)] if arcus.submitted else [],
+        def _attempt_seconds() -> float:
+            full = max(1.0, float(self.settings.maker_wait_seconds))
+            if not is_open:
+                return full
+            short = float(getattr(self.settings, "open_side_attempt_seconds", OPEN_SIDE_ATTEMPT_SEC))
+            return min(full, max(0.4, short))
+
+        async def _refresh_flipped_prices() -> str | None:
+            nonlocal lighter_price, arcus_price
+            fresh_side = await self._fresh_maker_prices(
+                market, lighter_side, arcus_side, closing=False,
             )
-        lighter = LegResult("lighter", False, submitted=False, raw={"waiting_for_arcus_fill": True})
-        t0 = time.monotonic()
-        arcus_signed = arcus_quantity if arcus_side == "buy" else -arcus_quantity
-        deadline = t0 + max(1.0, float(self.settings.maker_wait_seconds))
-        hedged_arcus = 0.0
-        filled_abs = 0.0
-        while time.monotonic() < deadline:
-            _after_l, after_a = await self.read_positions(lighter_symbol, arcus_id)
-            verdict = classify_fill(
-                before=before_arcus, after=after_a, requested_signed=arcus_signed,
-            )
+            if fresh_side is None:
+                return "读不到两边盘口，翻边后不下单"
+            ok_px, why_px, lighter_price, arcus_price = fresh_side
+            quotes["lighter_join"] = lighter_price
+            quotes["arcus_join"] = arcus_price
+            quotes["maker_rule"]["lighter_join"] = lighter_price
+            quotes["maker_rule"]["arcus_join"] = arcus_price
+            if not ok_px:
+                return why_px or "翻边后挂单价算不出来"
+            return None
+
+        def _remember_sides() -> None:
+            quotes["maker_rule"]["lighter_side"] = lighter_side
+            quotes["maker_rule"]["arcus_side"] = arcus_side
+            named = paired_direction(lighter_side, arcus_side)
+            if named:
+                quotes["filled_direction"] = named
+
+        def _filled_from(verdict: FillVerdict) -> float:
             if arcus_quantity <= 0:
-                filled_abs = 0.0
-            elif verdict.kind == "full":
-                filled_abs = arcus_quantity
-            elif verdict.should_hedge and verdict.filled != verdict.filled:
-                filled_abs = arcus_quantity
-            elif verdict.is_fill:
-                filled_abs = min(arcus_quantity, abs(float(verdict.filled)))
-            else:
-                filled_abs = 0.0
+                return 0.0
+            if verdict.kind == "full":
+                return arcus_quantity
+            if verdict.should_hedge and verdict.filled != verdict.filled:
+                return arcus_quantity
+            if verdict.is_fill:
+                return min(arcus_quantity, abs(float(verdict.filled)))
+            return 0.0
+
+        async def _hedge_lighter(need: float) -> LegResult:
+            # Arcus 已经成交才吃 Lighter。在这之前一张 Lighter 单都不发。
+            ioc_qty = lighter_quantity * (need / arcus_quantity)
+            ref = float(lighter_price)
+            try:
+                book = await self.market.lighter_book(
+                    market["lighter_market_index"], market["lighter_symbol"], limit=20,
+                )
+                take = hedge_take_price(book, lighter_side)
+                if take:
+                    ref = float(take)
+            except Exception:  # noqa: BLE001
+                pass
+            limit = slippage_limit_price(
+                ref, lighter_side, float(self.settings.order_slippage_bps),
+            )
+            leg = await self._lighter_ioc(
+                market["lighter_market_index"], lighter_side, ioc_qty, limit,
+                lighter_decimals, reduce_only,
+            )
+            _stamp(leg, side=lighter_side, requested=ioc_qty, reference_price=ref)
+            quotes["lighter_taker"] = True
+            return leg
+
+        async def _settle_open(
+            arcus_leg: LegResult, before_a: float, signed: float,
+            filled_abs: float, hedged_arcus: float, lighter_leg: LegResult,
+        ) -> tuple[bool, bool, float, float, float, LegResult]:
+            """撤掉这一边并确认，再重读仓位。撤单前后成交的部分先在 Lighter 吃单对冲。"""
+            cancel_ok = await self._cancel_arcus_confirmed(market, arcus_leg)
+            after_a = float("nan")
+            for attempt in range(3):
+                _after_l, after_a = await self.read_positions(lighter_symbol, arcus_id)
+                if math.isfinite(after_a):
+                    break
+                await asyncio.sleep(0.3 * (attempt + 1))
+            readable = math.isfinite(after_a) and math.isfinite(before_a)
+            if readable:
+                late = classify_fill(before=before_a, after=after_a, requested_signed=signed)
+                filled_abs = max(filled_abs, _filled_from(late))
             need = filled_abs - hedged_arcus
             if need > 1e-8 and lighter_quantity > 0:
-                # Arcus 已经成交才吃 Lighter。在这之前一张 Lighter 单都不发。
-                ioc_qty = lighter_quantity * (need / arcus_quantity)
-                ref = float(lighter_price)
-                try:
-                    book = await self.market.lighter_book(
-                        market["lighter_market_index"], market["lighter_symbol"], limit=20,
-                    )
-                    take = hedge_take_price(book, lighter_side)
-                    if take:
-                        ref = float(take)
-                except Exception:  # noqa: BLE001
-                    pass
-                limit = slippage_limit_price(
-                    ref, lighter_side, float(self.settings.order_slippage_bps),
-                )
-                leg = await self._lighter_ioc(
-                    market["lighter_market_index"], lighter_side, ioc_qty, limit,
-                    lighter_decimals, reduce_only,
-                )
-                _stamp(leg, side=lighter_side, requested=ioc_qty, reference_price=ref)
-                lighter = leg
-                quotes["lighter_taker"] = True
+                leg = await _hedge_lighter(need)
+                lighter_leg = leg
                 if leg.ok or leg.submitted:
                     hedged_arcus += need
-            if (
-                filled_abs >= arcus_quantity * 0.98
-                and (lighter_quantity <= 0 or (lighter.ok and hedged_arcus >= filled_abs * 0.98))
-            ):
-                break
-            if (
-                action in ("open", "topup") and filled_abs <= 0
-                and quotes.get("_requotes", 0) < 3
-            ):
-                moved = await self._requote_both_if_touch_moved(
-                    market, lighter_side, arcus_side, lighter, arcus,
-                    lighter_quantity, arcus_quantity, reduce_only, lighter_decimals, quotes,
-                )
-                if moved is not None:
-                    _lighter_ignored, arcus = moved
-            if stop is not None and stop.is_set():
-                if filled_abs <= 0:
-                    await self._cancel_maker_resting(market, arcus, None)
+            return cancel_ok, readable, after_a, filled_abs, hedged_arcus, lighter_leg
+
+        def _open_outcome(
+            cancel_ok: bool, filled_abs: float, hedged_arcus: float,
+            lighter_leg: LegResult, arcus_leg: LegResult,
+        ) -> PairResult | None:
+            """有成交（全部或部分）就在这里收尾，不再翻边。没有成交返回 None。"""
+            if filled_abs <= 1e-8:
+                return None
+            legs = [(ledger_action, leg) for leg in (lighter_leg, arcus_leg)
+                    if leg is not None and leg.submitted]
+            if lighter_quantity > 0 and not (lighter_leg.ok and hedged_arcus >= filled_abs * 0.98):
                 return PairResult(
-                    False, "maker_stopped", lighter, arcus,
-                    reason="挂单被叫停，未成交的 Arcus 已撤，Lighter 不会先成交",
+                    False, "lighter_hedge_failed", lighter_leg, arcus_leg,
+                    reason="Arcus 已成交，Lighter 吃单还没对上。不把 Arcus 改成吃单，也不刮掉 Arcus",
                     quotes=quotes, elapsed_ms=(time.monotonic() - started) * 1000,
+                    notes=["Lighter 是对冲腿，可以吃单；Arcus 仍然只做 maker；有成交就不翻边"],
+                    ledger=legs,
                 )
-            if not await self._sleep_gap(0.5, stop):
-                if filled_abs <= 0:
-                    await self._cancel_maker_resting(market, arcus, None)
+            frac = 1.0 if filled_abs >= arcus_quantity * 0.98 else filled_abs / arcus_quantity
+            base = float(quantity if quantity is not None else lighter_quantity)
+            if arcus_leg.submitted:
+                arcus_leg.filled = filled_abs
+                arcus_leg.fill_confirmed = True
+            if lighter_leg.submitted:
+                lighter_leg.filled = lighter_quantity * frac
+                lighter_leg.fill_confirmed = True
+            quotes["filled_quantity"] = base * frac
+            notes = ["Arcus maker 成交后，Lighter 已吃单对冲"]
+            if frac < 1.0:
+                quotes["partial_fill"] = True
+                notes.append(
+                    f"Arcus 只成交 {filled_abs:g}/{arcus_quantity:g}，已在 Lighter 对冲这一部分，"
+                    f"剩余已撤，不翻边"
+                )
+            if not cancel_ok:
+                notes.append("⚠ 剩余 Arcus 撤单未确认，下一轮风控核对两腿")
+            _remember_sides()
+            return PairResult(
+                True, "opened", lighter_leg, arcus_leg, quotes=quotes,
+                elapsed_ms=(time.monotonic() - started) * 1000,
+                notes=notes, ledger=legs,
+            )
+
+        async def _flip() -> str | None:
+            nonlocal lighter_side, arcus_side, flipped
+            lighter_side = _other_side(lighter_side)
+            arcus_side = _other_side(arcus_side)
+            flipped = True
+            quotes["open_flipped"] = True
+            quotes["_requotes"] = 0
+            return await _refresh_flipped_prices()
+
+        flipped = False
+        lighter = LegResult("lighter", False, submitted=False, raw={"waiting_for_arcus_fill": True})
+        while True:
+            _remember_sides()
+            arcus_signed = arcus_quantity if arcus_side == "buy" else -arcus_quantity
+            arcus = await _send_arcus(float(arcus_price))
+            if arcus_quantity > 0 and not arcus.ok:
+                if is_open and not flipped and _is_would_cross(arcus.error):
+                    # 挪档之后仍会吃单：没挂住。确认没有残单、仓位没动，再翻到另一边。
+                    cancel_ok, readable, after_a, filled_abs, hedged_arcus, lighter = (
+                        await _settle_open(arcus, before_arcus, arcus_signed, 0.0, 0.0, lighter)
+                    )
+                    done = _open_outcome(cancel_ok, filled_abs, hedged_arcus, lighter, arcus)
+                    if done is not None:
+                        return done
+                    if not (cancel_ok and readable):
+                        return PairResult(
+                            False, "arcus_not_resting", None, arcus,
+                            reason="Arcus 会吃单没挂住；撤单或仓位确认不了，不翻边。Lighter 未发",
+                            quotes=quotes, elapsed_ms=(time.monotonic() - started) * 1000,
+                            notes=["Lighter 未发"],
+                        )
+                    before_arcus = after_a
+                    why_flip = await _flip()
+                    if why_flip:
+                        return PairResult(
+                            False, "spread_wait", None, arcus,
+                            reason=why_flip, quotes=quotes,
+                            elapsed_ms=(time.monotonic() - started) * 1000,
+                            notes=["第一边会吃单，翻边后挂单价算不出来，Lighter 未发"],
+                        )
+                    continue
                 return PairResult(
-                    False, "maker_stopped", lighter, arcus,
-                    reason="挂单被叫停，未成交的 Arcus 已撤",
+                    False, "arcus_not_resting", None, arcus,
+                    reason="Arcus 没挂住，Lighter 未发",
                     quotes=quotes, elapsed_ms=(time.monotonic() - started) * 1000,
+                    notes=["Lighter 未发"],
+                    ledger=[(ledger_action, arcus)] if arcus.submitted else [],
+                )
+            lighter = LegResult("lighter", False, submitted=False, raw={"waiting_for_arcus_fill": True})
+            t0 = time.monotonic()
+            deadline = t0 + _attempt_seconds()
+            hedged_arcus = 0.0
+            filled_abs = 0.0
+            while time.monotonic() < deadline:
+                _after_l, after_a = await self.read_positions(lighter_symbol, arcus_id)
+                verdict = classify_fill(
+                    before=before_arcus, after=after_a, requested_signed=arcus_signed,
+                )
+                filled_abs = _filled_from(verdict)
+                need = filled_abs - hedged_arcus
+                if need > 1e-8 and lighter_quantity > 0:
+                    leg = await _hedge_lighter(need)
+                    lighter = leg
+                    if leg.ok or leg.submitted:
+                        hedged_arcus += need
+                if (
+                    filled_abs >= arcus_quantity * 0.98
+                    and (lighter_quantity <= 0 or (lighter.ok and hedged_arcus >= filled_abs * 0.98))
+                ):
+                    break
+                if (
+                    action in ("open", "topup") and filled_abs <= 0
+                    and quotes.get("_requotes", 0) < 3
+                ):
+                    moved = await self._requote_both_if_touch_moved(
+                        market, lighter_side, arcus_side, lighter, arcus,
+                        lighter_quantity, arcus_quantity, reduce_only, lighter_decimals, quotes,
+                    )
+                    if moved is not None:
+                        _lighter_ignored, arcus = moved
+                stopped = stop is not None and stop.is_set()
+                if not stopped and not await self._sleep_gap(0.5, stop):
+                    stopped = True
+                if stopped:
+                    if is_open:
+                        cancel_ok, _readable, _after, filled_abs, hedged_arcus, lighter = (
+                            await _settle_open(
+                                arcus, before_arcus, arcus_signed, filled_abs, hedged_arcus, lighter,
+                            )
+                        )
+                        done = _open_outcome(cancel_ok, filled_abs, hedged_arcus, lighter, arcus)
+                        if done is not None:
+                            return done
+                        return PairResult(
+                            False, "maker_stopped", lighter, arcus,
+                            reason="挂单被叫停，未成交的 Arcus 已撤，Lighter 不会先成交",
+                            quotes=quotes, elapsed_ms=(time.monotonic() - started) * 1000,
+                        )
+                    if filled_abs <= 0:
+                        await self._cancel_maker_resting(market, arcus, None)
+                    return PairResult(
+                        False, "maker_stopped", lighter, arcus,
+                        reason="挂单被叫停，未成交的 Arcus 已撤，Lighter 不会先成交",
+                        quotes=quotes, elapsed_ms=(time.monotonic() - started) * 1000,
+                    )
+
+            if filled_abs >= arcus_quantity * 0.98 and (lighter_quantity <= 0 or lighter.ok):
+                if lighter.submitted:
+                    lighter.filled = lighter_quantity
+                    lighter.fill_confirmed = True
+                if arcus.submitted:
+                    arcus.filled = arcus_quantity
+                    arcus.fill_confirmed = True
+                quotes["filled_quantity"] = float(quantity if quantity is not None else lighter_quantity)
+                _remember_sides()
+                ok_stage = "closed" if action == "close" else "opened"
+                return PairResult(
+                    True, ok_stage, lighter, arcus, quotes=quotes,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                    notes=["Arcus maker 成交后，Lighter 已吃单对冲"],
+                    ledger=[(ledger_action, leg) for leg in (lighter, arcus) if leg.submitted],
                 )
 
-        if filled_abs >= arcus_quantity * 0.98 and (lighter_quantity <= 0 or lighter.ok):
-            if lighter.submitted:
-                lighter.filled = lighter_quantity
-                lighter.fill_confirmed = True
-            if arcus.submitted:
-                arcus.filled = arcus_quantity
-                arcus.fill_confirmed = True
-            quotes["filled_quantity"] = float(quantity if quantity is not None else lighter_quantity)
-            ok_stage = "closed" if action == "close" else "opened"
-            return PairResult(
-                True, ok_stage, lighter, arcus, quotes=quotes,
-                elapsed_ms=(time.monotonic() - started) * 1000,
-                notes=["Arcus maker 成交后，Lighter 已吃单对冲"],
-                ledger=[(action if action != "topup" else "open", leg)
-                        for leg in (lighter, arcus) if leg.submitted],
+            if not is_open:
+                # 平仓 / 补仓：和 v1.8 一样，不翻边。
+                if filled_abs > 1e-8:
+                    return PairResult(
+                        False, "lighter_hedge_failed", lighter, arcus,
+                        reason="Arcus 已成交，Lighter 吃单还没对上。不把 Arcus 改成吃单，也不刮掉 Arcus",
+                        quotes=quotes, elapsed_ms=(time.monotonic() - started) * 1000,
+                        notes=["Lighter 是对冲腿，可以吃单；Arcus 仍然只做 maker"],
+                        ledger=[(ledger_action, leg)
+                                for leg in (lighter, arcus) if leg is not None and leg.submitted],
+                    )
+                await self._cancel_maker_resting(market, arcus, None)
+                return PairResult(
+                    False, "legs_timeout", lighter, arcus,
+                    reason=f"Arcus 挂单 {self.settings.maker_wait_seconds:g} 秒内没成交，已撤。Lighter 未发",
+                    quotes=quotes, elapsed_ms=(time.monotonic() - started) * 1000,
+                    notes=["Lighter 未发，没有裸腿"],
+                    ledger=[(ledger_action, arcus)] if arcus.submitted else [],
+                )
+
+            # 开仓：这一边到点没有全部成交。先撤并确认，部分成交先对冲，再决定翻不翻。
+            cancel_ok, readable, after_a, filled_abs, hedged_arcus, lighter = await _settle_open(
+                arcus, before_arcus, arcus_signed, filled_abs, hedged_arcus, lighter,
             )
-        if filled_abs > 1e-8:
-            return PairResult(
-                False, "lighter_hedge_failed", lighter, arcus,
-                reason="Arcus 已成交，Lighter 吃单还没对上。不把 Arcus 改成吃单，也不刮掉 Arcus",
-                quotes=quotes, elapsed_ms=(time.monotonic() - started) * 1000,
-                notes=["Lighter 是对冲腿，可以吃单；Arcus 仍然只做 maker"],
-                ledger=[(action if action != "topup" else "open", leg)
-                        for leg in (lighter, arcus) if leg is not None and leg.submitted],
-            )
-        await self._cancel_maker_resting(market, arcus, None)
-        return PairResult(
-            False, "legs_timeout", lighter, arcus,
-            reason=f"Arcus 挂单 {self.settings.maker_wait_seconds:g} 秒内没成交，已撤。Lighter 未发",
-            quotes=quotes, elapsed_ms=(time.monotonic() - started) * 1000,
-            notes=["Lighter 未发，没有裸腿"],
-            ledger=[(action if action != "topup" else "open", arcus)] if arcus.submitted else [],
-        )
+            done = _open_outcome(cancel_ok, filled_abs, hedged_arcus, lighter, arcus)
+            if done is not None:
+                return done
+            waited = _attempt_seconds()
+            if flipped or not cancel_ok or not readable:
+                if flipped:
+                    reason = f"Arcus 两边各挂约 {waited:g} 秒都没成交，已撤。Lighter 未发"
+                elif not cancel_ok:
+                    reason = f"Arcus 挂 {waited:g} 秒没成交，撤单没确认，不翻边。Lighter 未发"
+                else:
+                    reason = f"Arcus 挂 {waited:g} 秒没成交，撤后读不到仓位，不翻边。Lighter 未发"
+                return PairResult(
+                    False, "legs_timeout", lighter, arcus,
+                    reason=reason,
+                    quotes=quotes, elapsed_ms=(time.monotonic() - started) * 1000,
+                    notes=["Lighter 未发，没有裸腿"],
+                    ledger=[(ledger_action, arcus)] if arcus.submitted else [],
+                )
+            before_arcus = after_a
+            why_flip = await _flip()
+            if why_flip:
+                return PairResult(
+                    False, "legs_timeout", lighter, arcus,
+                    reason=why_flip, quotes=quotes,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                    notes=[f"第一边空挂 {waited:g} 秒已撤，翻边后挂不上，Lighter 未发"],
+                    ledger=[(ledger_action, arcus)] if arcus.submitted else [],
+                )
+
+    async def _cancel_arcus_confirmed(
+        self, market: dict[str, Any], arcus: LegResult | None,
+        *, attempts: int = 6, gap: float = 0.5,
+    ) -> bool:
+        """撤掉这一边的 Arcus 挂单，并用 /v1/openOrders 确认本程序在这个市场已没有挂单。
+
+        本程序的单 clientId 以 ph 开头；跟价重挂时没撤干净的旧单也一起撤。手动挂的单不碰。
+        被交易所当场拒掉、从没挂住的单直接算确认。挂单列表读不到、或单还在，返回 False：
+        调用方不得翻到另一边。撤单那一刻已经成交的单也不在列表里，调用方随后重读仓位去对冲。
+        """
+        if arcus is None or (not arcus.submitted and not arcus.uncertain):
+            return True
+        raw = arcus.raw if isinstance(arcus.raw, dict) else {}
+        primary = str(raw.get("orderId") or "")
+        primary_cid = str(raw.get("clientId") or "").lower()
+        if primary:
+            await self._cancel_maker_resting(market, arcus, None)
+        tries = max(1, attempts)
+        for attempt in range(tries):
+            try:
+                orders = await self.market.arcus_open_orders(int(market["arcus_market_id"]))
+            except Exception:  # noqa: BLE001
+                orders = None
+            if orders is not None:
+                ours = []
+                for o in orders:
+                    if not isinstance(o, dict):
+                        continue
+                    oid = str(o.get("orderId") or o.get("id") or "")
+                    cid = str(o.get("clientId") or "").lower()
+                    if (primary and oid == primary) or (primary_cid and cid == primary_cid) \
+                            or cid.startswith("ph"):
+                        ours.append(oid)
+                if not ours:
+                    return True
+                if attempt == 0 or attempt == tries // 2:
+                    for oid in ours:
+                        if oid:
+                            await self._arcus_cancel(market, oid)
+            if attempt < tries - 1:
+                await asyncio.sleep(gap)
+        return False
 
     async def _reprice_would_cross(
         self, leg: LegResult, market: dict[str, Any], venue: str, side: str,

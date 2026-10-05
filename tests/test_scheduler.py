@@ -90,9 +90,9 @@ def test_closes_when_the_rotation_period_is_reached():
 def test_opens_when_flat_and_everything_checks_out():
     d = call(task(), FLAT)
     assert d.plan == "open"
-    assert d.direction == "long_lighter_short_arcus"
+    assert d.direction is None
     assert d.quantity == pytest.approx(0.2)
-    assert "净资金费" in d.reason
+    assert "资金费不选方向" in d.reason
 
 
 # ── 开仓闸门 ────────────────────────────────────────────

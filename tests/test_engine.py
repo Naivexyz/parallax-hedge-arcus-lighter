@@ -1463,3 +1463,20 @@ def test_sol_mark_pnl_inside_the_window_does_not_send_when_live_close_loses_more
         assert kw["quotes"]["force_close"] is True
         assert kw["lighter_side"] == "sell" and kw["arcus_side"] == "buy"
         assert store.get_task("OAI")["opened_at"] is None
+
+
+def test_funding_direction_does_not_choose_the_open_side():
+    """快照里的资金费方向是 Arcus 多，记下来的开仓方向仍是先卖 Arcus。"""
+    r = row()
+    r["direction"] = "short_lighter_long_arcus"
+    r["direction_label"] = "Lighter 空 / Arcus 多"
+    r["lighter_bps_per_hour"] = 2.0
+    r["arcus_bps_per_hour"] = 0.1
+    r["net_bps_per_hour"] = 1.9
+    with tempfile.TemporaryDirectory() as tmp:
+        eng, store, _ = make(tmp, r)
+        store.upsert_task("OAI", enabled=1, leverage=6.0, rotation_hours=4.0)
+        decisions = run(eng.run_cycle())
+        assert decisions[0]["plan"] == "open"
+        assert "资金费不选方向" in decisions[0]["reason"]
+        assert store.get_task("OAI")["open_direction"] == "long_lighter_short_arcus"

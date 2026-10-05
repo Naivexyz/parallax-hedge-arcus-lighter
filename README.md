@@ -64,13 +64,13 @@ macOS / Linux：`./start.sh`（需要自行安装 Python 3.11 或 3.12）。
 
 扫描间隔在面板上（默认 20 秒，最短 5 秒）。最短持有、最长持有、浮盈亏差额也在面板上，改完下一轮就用，不用重启。不再用价差多少 bp 决定开仓或平仓，下单设置里也没有这个字段。
 
-- **开仓**：不看谁贵。所间价差不拦，也不拿「浮盈亏差额」拦。只先挂 Arcus maker。`POST_ONLY_WOULD_CROSS` 就往不吃单的一侧挪一档再挂 Arcus，这时仍然不发 Lighter。Arcus 成交之后立刻 IOC Lighter，不等 Lighter maker，也不因为 Lighter 还没 maker 成交就刮掉 Arcus。Arcus 一直不成交就撤掉这张 Arcus，Lighter 一张都不发。盘口挪了、Arcus 还没成交，只跟着重挂 Arcus。
+- **开仓**：不看资金费，也不看谁贵。所间价差不拦，也不拿「浮盈亏差额」拦。先挂 Arcus 卖（maker / ALO）。`POST_ONLY_WOULD_CROSS` 先往不吃单的一侧挪一档；挪完仍会吃单，立刻撤掉并改挂 Arcus 买，这时仍然不发 Lighter。这一边如果挂住了，只等 15 秒（`OPEN_SIDE_ATTEMPT_SECONDS`），没成交就撤掉并翻到另一边，只翻一次，不等满 120 秒。翻边前先撤单，并用 Arcus 挂单列表确认本程序在这个市场已经没有挂单，再重读仓位；确认不了就不翻，两边的 Arcus 不会同时挂着。这一边有成交（哪怕只成交一部分）就先在 Lighter IOC 对冲这部分，剩余撤掉，不再翻边。哪一边先成交，立刻用 Lighter IOC 吃相反的一边。两边都没成交就撤掉，Lighter 一张都不发。平仓不翻边。
 - **平仓**：两条腿都成交之后，至少再持有面板上的最短时间（默认 3 秒）。然后只看每一边自己的开仓价对上即将使用的平仓价（Arcus 是 maker 价，Lighter 是吃单价），两腿加总。不低于「负的浮盈亏差额」（面板那一个字段，默认 0.02 USDC，可改成 0.05 或 0.01）就先挂 Arcus maker，成交后立刻 IOC Lighter 平掉。两边书没动，合计接近 0，要平。所间价差不算进这笔亏损。合计正好等于负的差额，也平；更差就先不发，Arcus 不改吃单。持有满最长持有（默认 300 秒）可以跟盘挂 Arcus maker，成交后 Lighter 吃单；Arcus 仍然不吃单。
 
 计划内平仓在发单前用每一边自己的开仓价对上即将使用的平仓价重算（Arcus maker，Lighter 吃单），不能只看标记浮盈亏，也不把两所价差算成亏损。按这个合计差于面板「浮盈亏差额」时，先不发单，Arcus 不改吃单。到了最长持有可以跟盘挂 Arcus maker，成交后再让 Lighter 吃单。Arcus 没成交就撤掉它，不发 Lighter。风控和临近强平仍立刻吃单，这是 Arcus 可以吃单的唯一情况。已经留下的孤腿仍只挂 maker 退出，不在开仓等待里主动制造 Lighter 裸腿。
 - **仓位大小**：按两边可用保证金里小的那一边算，再按任务的「单边名义上限」截断。
 
-下面这些旧说法作废：按资金费选方向、持有固定周期再平、两条腿隔 3 秒、两边一起挂 maker 然后等 Lighter 先成交。
+下面这些旧说法作废：按资金费选方向、持有固定周期再平、两条腿隔 3 秒、两边一起挂 maker 然后等 Lighter 先成交。资金费表只供查看，开仓不调用它来决定多空。
 
 ### 风控（安全动作永远压过交易动作）
 
@@ -100,7 +100,8 @@ Arcus 不返回强平价，程序按账户权益和维持保证金率自己算�
 | `REOPEN_COOLDOWN_SECONDS` | 60 | 平仓后隔多久才允许重开 |
 | `ORDER_SLIPPAGE_BPS` | 10 | Lighter 吃单和紧急平仓的滑点上限。Arcus 正常开平仍是 maker |
 | `ARCUS_MAKER` | true | Arcus 只做 maker，必须先成交。成交后立刻 IOC Lighter。Arcus 不吃单，除非风控或临近强平 |
-| `MAKER_WAIT_SECONDS` | 120 | Arcus maker 最多等多久。没成交就撤掉，并且不发 Lighter。成交后立刻吃单对冲 Lighter |
+| `MAKER_WAIT_SECONDS` | 120 | 平仓时 Arcus maker 最多等多久。开仓每一边不等满这个数 |
+| `OPEN_SIDE_ATTEMPT_SECONDS` | 15 | 开仓一边空挂这么多秒就翻到另一边，只翻一次。会吃单则立刻翻 |
 | `MIN_HOLD_SEC` | 3 | 两腿都成交后至少持有这么多秒，才按浮盈亏平仓。面板上也能改 |
 | `MAX_HOLD_SEC` | 300 | 持有满这么多秒可以跟盘挂 Arcus maker，成交后 Lighter 吃单。Arcus 不改吃单 |
 | `PNL_CLOSE_USD` | 0.02 | 浮盈亏差额（USDC）。只用于每一边自己的开仓价对上自己的平仓价。所间价差不拿它拦开仓 |

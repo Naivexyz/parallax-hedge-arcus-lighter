@@ -160,6 +160,7 @@ def create_app(settings: Settings) -> FastAPI:
                 "ORDER_SLIPPAGE_BPS": settings.order_slippage_bps,
                 "ARCUS_MAKER（Arcus 挂单）": settings.arcus_maker,
                 "MAKER_WAIT_SECONDS": settings.maker_wait_seconds,
+                "OPEN_SIDE_ATTEMPT_SECONDS（开仓每边试挂）": settings.open_side_attempt_seconds,
                 "FUNDING_STALE_MAX_SECONDS": settings.funding_stale_max_seconds,
             },
         }

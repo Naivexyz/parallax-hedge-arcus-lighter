@@ -90,8 +90,12 @@ class Settings:
     order_slippage_bps: float = 10.0
     # 挂单模式：Arcus 那条腿挂 ALO（0 手续费），成交后去 Lighter 吃单对冲
     arcus_maker: bool = False
-    # 挂单最多等多久（秒）。开仓等不到就撤单下轮再挂；平仓没挂完的剩余下一轮再挂 maker
+    # 挂单最多等多久（秒）。平仓等不到就撤单下轮再挂。
+    # 开仓每一边不等满这个数，见 open_side_attempt_seconds。
     maker_wait_seconds: float = 120.0
+    # 开仓：一边 Arcus maker 空挂超过这么多秒就撤掉并翻到另一边。只翻一次。
+    # POST_ONLY_WOULD_CROSS 在挪档之后仍失败则立刻翻，不等这 15 秒。
+    open_side_attempt_seconds: float = 15.0
     # 旧的价差 bp 阈值。不再用来决定开仓或平仓，面板和设置接口也不再读写它。
     max_spread_bps: float = 1.0
     # 两腿都成交之后，至少持有这么多秒，才允许按浮盈亏平仓。
@@ -184,6 +188,7 @@ class Settings:
             dry_run=_clean(raw.get("DRY_RUN", "true")).lower() not in ("0", "false", "no"),
             arcus_maker=_clean(raw.get("ARCUS_MAKER", "false")).lower() in ("1", "true", "yes"),
             maker_wait_seconds=_num(raw.get("MAKER_WAIT_SECONDS"), 120.0),
+            open_side_attempt_seconds=_num(raw.get("OPEN_SIDE_ATTEMPT_SECONDS"), 15.0),
             max_spread_bps=_num(raw.get("MAX_SPREAD_BPS"), 1.0),
             min_hold_sec=_num(raw.get("MIN_HOLD_SEC"), 3.0),
             max_hold_sec=_num(raw.get("MAX_HOLD_SEC"), 300.0),

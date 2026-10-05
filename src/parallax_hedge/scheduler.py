@@ -189,9 +189,9 @@ def decide(
 
     return CycleDecision(
         "open",
-        f"按 {choice.direction_label} 开仓 {quantity:g}，"
-        f"净资金费 {choice.net_bps_per_hour:+.3f} bps/h",
-        direction=choice.direction,
+        f"空仓开仓 {quantity:g}。先挂 Arcus 卖，约 15 秒没成交或挂上去会吃单就翻成买，只翻一次。"
+        f"资金费不选方向。",
+        direction=None,
         quantity=quantity,
     )
 
